@@ -1,0 +1,665 @@
+---
+title: "RNA-Seq Hands-on: Variance Partition Analysis"
+author: "Franziska Kimmig"
+date: "09/29/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## RNA-Seq Hands-on - Differential gene expression analysis
+
+Now that we better understand the different sources of variation through our exploratory analyses we will continue with some hypothesis driven analyses. From PCA and variance partition we have seen that the infection status and disease course affect the transcriptome. We will now identify transcripts that are differentially expressed between healthy controls and patients with COVID-19 with different disease severity (pseudotime) and investigate the impact of sex on differential expression. 
+
+
+### Setup
+
+First let's load the necessary external libraries.
+
+```{r, results='hide', message=FALSE}
+library(tidyverse)
+library(reshape2)
+library(DESeq2)
+library(ggrepel)
+library(ggvenn)
+library(ggpubr)
+library(topGO)
+library(org.Hs.eg.db)
+
+folder <- "output_DGE/"
+
+if (!dir.exists(folder)){
+  dir.create(folder)
+}
+```
+
+
+Again we will load the data and bring it into a format that we can run the analysis functions on. 
+
+```{r}
+##Read sample info file
+covid_info_file <- read.csv("input/Sequenced_sample_metadata_020720.csv")
+covid_info_file$Pseudotime <- as.character(covid_info_file$Pseudotime)
+
+##Read raw count file
+count_data <- read.csv("input/COVID_control_raw_counts_070720.txt", sep = '\t')
+count_data <- count_data[, as.character(covid_info_file$RNAseqID)]
+
+##Format sample col data, the patient data
+col_data <- covid_info_file
+rownames(col_data) <- col_data$RNAseqID
+
+#Read the file that maps gene Ensembl ID to gene name so that we can understand the genes better later on
+ensg2gene <- read.table("input/gencode_v25_gene_info.txt", header = T)
+unique_ensg2gene <- subset(ensg2gene, duplicated(ensg2gene$Gene_id) == FALSE)
+rownames(unique_ensg2gene) <- unique_ensg2gene$Gene_id
+```
+
+
+
+
+### Inspection of the experimental design
+
+We will first have a closer look at the sample numbers across sex and disease severities.
+
+Look up the number of male and female patients and controls.
+
+```{r, fig.height=3, fig.width=4}
+col_data$Infection_status <- ifelse(col_data$Disease.traj == "Healthy", "Control", "COVID-19")
+
+patient_data <- col_data[, c("PatientID", "Sex", "Age", "Infection_status")] %>%
+  unique()
+
+plot_patient_number <- ggplot(patient_data, aes(x = Infection_status, color = Sex, fill = Sex)) +
+  geom_bar(position = "dodge") +
+  scale_y_continuous(breaks = c(0, 5, 10)) +
+  theme_bw()
+
+plot_patient_number
+ggsave(plot_patient_number, filename = paste0(folder, "barplot_patient_numbers.png"), width = 4, height = 3)
+```
+
+We will also have a look at the sample numbers per pseudotime per sex.
+
+```{r, fig.height=5, fig.width=4}
+col_data$Disease.traj <- factor(col_data$Disease.traj, 
+                                levels = c("Healthy","Complicated (incremental)",
+                                         "Critical","Complicated with hyperinflammatory syndrom",
+                                         "Complicated (recovering)","Mild (recovering)",
+                                         "recovery/asymptomatic","Recovered"), 
+                                ordered = T)
+
+plot_sample_number <- ggplot(col_data, aes(x = Disease.traj, color = Sex, fill = Sex)) +
+  geom_bar(position = "dodge") +
+  scale_y_continuous(breaks = c(0, 5, 10)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot_sample_number
+ggsave(plot_sample_number, filename = paste0(folder, "barplot_sample_numbers.png"), width = 4, height = 3)
+```
+
+TASK
+
+* If we want to compare the different disease severities to healthy controls, what could be a problem?
+
+
+
+### Running the differential gene expression analysis
+
+We have different options to perform a sex-sensitive differential gene expression (DGE) analysis depending on our research question and the experimental design that we are working with. In our setup we are interested in differences between "cases" (COVID-19 infections) and "controls" (samples from healthy individuals).
+
+Option 1: *Include sex as a covariate*
+We can account for sex-differences by including sex in our model as a covariate. This approach accounts for systematic differences between males and females while estimating the overall effect of a COVID-19 infection. This is appropriate when sex is mainly a potential confounder and the main question is the case effect.
+
+Option 2: *Analyse males and females separately*
+We can perform the DGE analysis in a sex-stratified way by running a standard DGE analysis within each sex, e.g. case vs. control in males and females separately. This approach can be useful for identifying sex-specific case effects, but it does not directly test whether the effect of a COVID-19 infection differs between sexes.
+
+Option 3: *Test for an interaction between sex and case*
+We can specifically identify genes with an interaction between sex and disease severity in their expression, i.e. whether the effect of the COVID-19 infection is different between males and females.
+
+
+
+We will explore the different approaches by comparing "Mild (recovering)" samples to healthy controls. Subset the data to include only the samples we are interested in.
+
+```{r}
+#Filter info data for desired pseudotime
+col_data_sub <- subset(col_data, col_data$Pseudotime %in% c(0, 5))
+col_data_sub$Pseudotime <- as.factor(as.character(col_data_sub$Pseudotime))
+col_data_sub$Sex <- as.factor(col_data_sub$Sex)
+  
+#Filter count data for desired pseudotime
+count_data_sub <- count_data[, as.character(col_data_sub$RNAseqID)]
+```
+
+TASK
+
+* Check how many samples are left for the analysis and if both `col_data_sub` and `count_data_sub` contain the right amount of samples.
+
+
+
+#### DGE analysis - Option 1: Including sex as a covariate
+
+Let's start first by testing for the effect of the infection while accounting for potential sex differences. Create the DESeq object with the formula `~ Sex + Pseudotime` (this is the part where we account for sex), run the DGE analysis and save the output.
+
+```{r}
+#Create the DESeq object
+dds_counts <- DESeqDataSetFromMatrix(countData = count_data_sub, colData = col_data_sub, design = ~ Sex + Pseudotime)
+dds_counts <- dds_counts[ rowSums(counts(dds_counts)) > 1, ]
+dds_counts <- estimateSizeFactors(dds_counts)
+
+#Run DESeq
+dds <- DESeq(dds_counts, betaPrior = FALSE)
+res <- results(dds, independentFiltering = TRUE, alpha = 0.05, contrast = c("Pseudotime", "5", "0"))
+
+#Prepare and save the result
+res_table_5_0 <- as.data.frame(res) %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene, by = "Gene_id") %>% #add gene symbols
+  .[order(.$pvalue, decreasing = FALSE), ] #order by p-value
+
+write.table(res_table_5_0, file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5.txt", sep = '')), sep = "\t", quote = FALSE)
+```
+
+TASK
+
+* Which other variables could be added to the model? Does it make sense to include additional variables in our experimental setting?
+
+* What changes in the result table when you extract the results with `contrast = c("Pseudotime", "0", "5")` instead? Save the new result table to the variable `res_0_5` so that you can compare it to the old one. 
+
+
+Familiarize yourself with the output.
+
+```{r}
+res_table_5_0 <- read.table(file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5.txt", sep = '')), sep = "\t")
+
+view(res_table_5_0)
+```
+
+TASK:
+
+* What do the columns `basemean`, `log2FoldChange`, `pvalue` and `padj` contain?
+
+
+We can now define our set of differentially expressed genes (DEGs). This contains genes with an adjusted p-value below a significant threshold (in our case and most other DGE analyses this threshold is 0.05). Additionally to filtering for significance, we can also include an effect size cutoff to only keep genes with a reasonable difference in expression between our cases and controls.
+
+```{r}
+df_result_5_0 <- res_table_5_0 %>%
+  add_column("direction" = case_when(.$log2FoldChange > 1 & .$padj < 0.05 ~ "up", 
+                                     .$log2FoldChange < -1 & .$padj < 0.05 ~ "down",
+                                     .default = "not significant"))
+
+```
+
+TASK
+
+* How many up- and downregulated DEGs do we have? Print the numbers by using the function `table` on the column "direction".
+
+* Modify the code to add a second column to the data.frame, that defines DEGs solely based on the significance without including a fold change cutoff. How many DEGs are there with this definition?
+
+
+A standard visualization for DGE results is the so-called volcano plot. It shows the top genes regarding significance and signed fold-change and resembles a volcano eruption with the most significant genes as the rocks tossed high into the sky.
+
+```{r, fig.height=3, fig.width=5}
+#prepare the data for plotting
+df_volcano <- df_result_5_0 %>%
+  add_column("log10_padj" = -log(.$padj, base = 10),
+             "color" = ifelse(sign(.$log2FoldChange) > 0, "up", "down"),
+             "label" = NA)
+
+#label the DEGs with the highest absolut fold change
+label_fc <- df_volcano %>% 
+  subset(.$direction %in% c("up", "down")) %>%
+  .[order(.$log2FoldChange, decreasing = TRUE), ] %>%
+  {c(head(., 3)$Gene_id, tail(., 3)$Gene_id)}
+df_volcano$label <- ifelse(df_volcano$Gene_id %in% c(label_fc), df_volcano$Gene_name, NA)
+
+plot_volcano <- ggplot(df_volcano, aes(x = log2FoldChange, y = log10_padj)) +
+  geom_point(aes(color = direction)) +
+  scale_color_manual(values = c("down" = "#3399FF", "up" = "#FF6666", "not significant" = "grey")) +
+  geom_text_repel(aes(label = label), 
+                  max.overlaps = 10, 
+                  size = 4,
+                  min.segment.length = unit(0.01, 'lines')) +
+  labs(x = "log2 fold change", y = expression(paste("-log"[10], "(padj)")), color = "Direction") +
+  geom_hline(yintercept = -log10(0.05), linetype = 2) +
+  geom_vline(xintercept = c(-1, 1), linetype = 2) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        axis.line = element_line(),
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 15))
+
+plot_volcano
+ggsave(plot_volcano, filename = paste0(folder, "volcano_sexCovariate.png"), width = 6, height = 4)
+```
+
+Let's have a look at the expression pattern of some of the significant genes.
+
+```{r, fig.height=3, fig.width=5}
+#prepare normalized and variance-stabilized count data
+vst_counts <- dds_counts %>%
+  vst(blind = TRUE) %>%
+  assay()
+
+#plot expression
+my_symbol <- "MMP8"
+my_gene <- unique_ensg2gene[unique_ensg2gene$Gene_name == my_symbol, "Gene_id"] %>%
+  str_sub(1, 15)
+
+df_plot <- data.frame("RNAseqID" = names(vst_counts[my_gene, ]),
+                      "expression" = vst_counts[my_gene, ]) %>%
+  merge(col_data, by = "RNAseqID")
+
+df_plot$Disease.traj <- factor(df_plot$Disease.traj, 
+                               levels = c("Healthy","Complicated (incremental)",
+                                        "Critical","Complicated with hyperinflammatory syndrom",
+                                        "Complicated (recovering)","Mild (recovering)",
+                                        "recovery/asymptomatic","Recovered"), 
+                               ordered = T)
+
+pseudotime_colors <- c("#A7A9AC","#E84F8C", "#7031B9", "#A04E9E", "#E65826", "#F99B1C", "#FDC077", "#51BBFE")
+
+df_mean <- df_plot %>%
+  split(~ .$Sex + .$Pseudotime) %>%
+  map_dbl(function(x){mean(x$expression)}) %>%
+  data.frame(names(.) %>% str_split("[.]") %>% map_dfr(.f = function(x){data.frame(t(x))}), "Mean" = .)
+
+df_mean <- df_plot %>%
+  group_by(Sex, Disease.traj) %>%
+  dplyr::summarize("mean" = mean(expression))
+
+plot_expression <- ggplot(df_plot, aes(x = Disease.traj, y = expression, color = Disease.traj, fill = Disease.traj)) +
+  geom_boxplot(alpha = 0.5) +
+  geom_point(position = position_jitter(height = 0)) +
+  facet_grid(. ~ Sex, scales = "free_y", switch = "y") +
+  geom_point(data = df_mean, aes(x = Disease.traj, y = mean, color = Disease.traj, fill = Disease.traj), size = 2.5, shape = 5) +
+  geom_line(data = df_mean, aes(x = Disease.traj, y = mean, group = 1), linewidth = 0.5, color = "black", linetype = "dashed") +
+  scale_fill_manual(values = pseudotime_colors) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(y = "Normalized expression", title = my_symbol, fill = "Pseudotime", color = "Pseudotime") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        strip.placement = "outside",
+        legend.position = "right",
+        strip.background.y = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white"))
+
+plot_expression
+ggsave(plot_expression, filename = paste0(folder, "boxplot_", my_symbol, ".png"), width = 5, height = 3)
+```
+
+#### DGE analysis - Option 2: Sex-stratified analysis
+
+We will now perform the DGE analysis by testing males and females separately. First, we will divide our dataset into samples from females and males and then run the analysis on both subsets of the data. Since we are testing each group separately, we don't need to include sex in our model.
+
+```{r}
+#Filter info and count data for desired pseudotime and female samples
+col_data_sub_f <- col_data %>%
+  subset(.$Pseudotime %in% c(0, 5)) %>%
+  subset(.$Sex == "f")
+col_data_sub_f$Pseudotime <- as.factor(as.character(col_data_sub_f$Pseudotime))
+count_data_sub_f <- count_data[, as.character(col_data_sub_f$RNAseqID)]
+
+#Create the DESeq object
+dds_counts_f <- DESeqDataSetFromMatrix(countData = count_data_sub_f, colData = col_data_sub_f, design = ~ Pseudotime)
+dds_counts_f <- dds_counts_f[ rowSums(counts(dds_counts_f)) > 1, ]
+dds_counts_f <- estimateSizeFactors(dds_counts_f)
+
+#Run DESeq
+dds_f <- DESeq(dds_counts_f, betaPrior = FALSE)
+res_f <- results(dds_f, independentFiltering = TRUE, alpha = 0.05, contrast = c("Pseudotime", "5", "0"))
+
+#Prepare and save the result
+res_table_5_0_f <- as.data.frame(res_f) %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene, by = "Gene_id") %>% #add gene symbols
+  .[order(.$pvalue, decreasing = FALSE), ] #order by p-value
+
+write.table(res_table_5_0_f, file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5_f.txt", sep = '')), sep = "\t", quote = FALSE)
+```
+
+TASK
+
+* Duplicate the code and modify it to run the same analysis for male samples.
+
+
+Let's compare the results from the sex-stratified analysis. First we need to label the DEGs and merge the result tables.
+
+```{r}
+#load the results from both comparisons
+res_table_5_0_f <- read.table(file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5_f.txt", sep = '')), sep = "\t")
+res_table_5_0_m <- read.table(file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5_m.txt", sep = '')), sep = "\t")
+
+#define DEGs and merge result tables
+res_table_5_0_f <- res_table_5_0_f %>%
+  add_column("direction" = case_when(.$log2FoldChange > 1 & .$padj < 0.05 ~ "up", 
+                                     .$log2FoldChange < -1 & .$padj < 0.05 ~ "down",
+                                     .default = "not significant"), 
+             .after = "padj")
+
+res_table_5_0_m <- res_table_5_0_m %>%
+  add_column("direction" = case_when(.$log2FoldChange > 1 & .$padj < 0.05 ~ "up", 
+                                     .$log2FoldChange < -1 & .$padj < 0.05 ~ "down",
+                                     .default = "not significant"), 
+             .after = "padj")
+
+res_merged <- res_table_5_0_f[, c(1:8)] %>%
+  merge(res_table_5_0_m, by = "Gene_id", suffixes = c("_f", "_m"))
+```
+
+
+Lets first investigate, if the genes show a similar direction and magnitude of their expression in both comparisons. For simplicity, we will focus in the following analysis only on genes with final DESeq results in both males and females.
+
+```{r, fig.height=3, fig.width=5}
+df_plot <- res_merged %>%
+  subset(! is.na(.$padj_m)) %>%
+  subset(! is.na(.$padj_f))
+
+plot_comaprison <- ggplot(df_plot, aes(x = log2FoldChange_f, y = log2FoldChange_m)) +
+  geom_point(alpha = 0.5) +
+  stat_cor(method = "spearman") +
+  scale_x_continuous(breaks = c(-10, -5, 0, 5)) +
+  scale_y_continuous(breaks = c(5, 0, 5)) + 
+  geom_vline(xintercept = 0, color = "orange") +
+  geom_hline(yintercept = 0, color = "orange") +
+  geom_abline(intercept = c(0, 0), slope = c(1, 1), color = "darkred") +
+  theme_bw() +
+  coord_equal()
+
+plot_comaprison
+ggsave(plot_comaprison, filename = paste0(folder, "dotplot_males_vs_females.png"), width = 6, height = 4)
+```
+TASK
+
+* Look up the gene with the lowest fold change in females. Which fold change does it have in males? In which comparisons is it significant?
+
+* Interpret the four different quadrants. What does it mean for a gene to lie in the upper left quadrant? What does it mean if a gene lies on the red diagonal?
+
+
+Next, we can investigate, which COVID-responsive genes are shared between females and males. We will first investigate the overlap of upregulated DEGs.
+ 
+```{r, fig.height=3, fig.width=5}
+degs_f <- res_merged %>%
+  subset(.$direction_f %in% c("up"))
+degs_m <- res_merged %>%
+  subset(.$direction_m %in% c("up"))
+
+plot_venn <- ggvenn(list("females" = degs_f$Gene_id, 
+                                     "males" = degs_m$Gene_id)) +
+  coord_fixed(clip = "off") +
+  theme(plot.margin = margin(20, 0, 0, 0))
+
+plot_venn 
+ggsave(plot_venn, filename = paste0(folder, "venn_males_vs_females_up.png"), width = 4, height = 3)
+```
+
+TASK
+
+* How many upregulated DEGs are shared between males and females?
+
+* Duplicate the code and modify it to plot a venn diagram that shows the overlap of downregulated DEGs.
+
+
+Note: There are multiple reasons why a gene could be tested positive for differential expression in one group, but not the other. One reason could be true biological differences. However, if sample sizes or variance patterns differ between groups, the power to detect differential expression can also differ. In our case, one reason could be for example fewer samples from females. This can reflect strongly on hard cutoffs like our significance threshold or effect size cutoff. We need to be aware of these limitations when interpreting our analysis.
+
+Both the fold change comparison and the overlap analysis only describe the differences between our female- and male- specific analysis, they do not formally test for a sex-specific effect. A way to properly address this is an interaction analysis, which we will explore in the following section.
+
+
+
+#### DGE analysis - Option 3: Interaction analysis
+
+In this section, we will perform an interaction analysis to test if there are genes with a significantly different effect of the COVID infection in males and females. In this case, all samples are included in the analysis and our formula contains the interaction term `Pseudotime + Sex + Pseudotime:Sex`.
+
+```{r}
+#Create the DESeq object
+dds_counts <- DESeqDataSetFromMatrix(countData = count_data_sub, colData = col_data_sub, design = ~ Pseudotime + Sex + Pseudotime:Sex)
+dds_counts <- dds_counts[ rowSums(counts(dds_counts)) > 1, ]
+dds_counts <- estimateSizeFactors(dds_counts)
+
+#Run DESeq
+dds <- DESeq(dds_counts, betaPrior = FALSE)
+```
+
+In this analysis, instead of one result we will extract three: 
+  - the effect of the infection in males,
+  - the effect of the infection in females and
+  - the interaction of the infection with sex
+
+```{r}
+#males
+res_table_f <- dds %>%
+  results(independentFiltering = TRUE, alpha = 0.05, contrast = c("Pseudotime", "5", "0")) %>% 
+  as.data.frame() %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene, by = "Gene_id") %>% 
+  .[order(.$pvalue, decreasing = FALSE), ] 
+write.table(res_table_f, file = file.path(folder, paste("DESeq2result_interaction_f.txt", sep = '')), sep = "\t", quote = FALSE)
+
+#females
+res_table_m <- dds %>%
+  results(independentFiltering = TRUE, alpha = 0.05, contrast = list(c("Pseudotime_5_vs_0", "Pseudotime5.Sexm"))) %>% 
+  as.data.frame() %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene, by = "Gene_id") %>% 
+  .[order(.$pvalue, decreasing = FALSE), ] 
+write.table(res_table_m, file = file.path(folder, paste("DESeq2result_interaction_m.txt", sep = '')), sep = "\t", quote = FALSE)
+
+#interaction
+res_table_i <- dds %>%
+  results(independentFiltering = TRUE, alpha = 0.05, name = "Pseudotime5.Sexm") %>% 
+  as.data.frame() %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene, by = "Gene_id") %>% 
+  .[order(.$pvalue, decreasing = FALSE), ] 
+write.table(res_table_i, file = file.path(folder, paste("DESeq2result_interaction_i.txt", sep = '')), sep = "\t", quote = FALSE)
+```
+
+
+Let's have a look at the actual expression patterns of some of the top genes to see how these test results translate to expression patterns. First, we need to merge our results and prepare the count data.
+
+```{r}
+#load and merge the result tables
+res_table_f <- read.table(file = file.path(folder, paste("DESeq2result_interaction_f.txt", sep = '')), sep = "\t")
+res_table_m <- read.table(file = file.path(folder, paste("DESeq2result_interaction_m.txt", sep = '')), sep = "\t")
+res_table_i <- read.table(file = file.path(folder, paste("DESeq2result_interaction_i.txt", sep = '')), sep = "\t")
+
+res_interaction <- res_table_f[, 1:7] %>%
+  merge(res_table_m[, 1:7], suffixes = c("_f", "_m"), by = "Gene_id")%>%
+  merge(res_table_i, by = "Gene_id") %>%
+  subset(! is.na(.$padj))
+
+#prepare normalized and variance-stabilized count data
+vst_counts <- dds_counts %>%
+  vst(blind = TRUE) %>%
+  assay()
+```
+
+
+Now we can select some interesting genes and visualize their expression patterns.
+
+```{r, fig.height=3, fig.width=5}
+#plot expression
+my_symbol <- "IGHV1-2"
+my_gene <- unique_ensg2gene[unique_ensg2gene$Gene_name == my_symbol, "Gene_id"] %>%
+  str_sub(1, 15)
+
+df_plot <- data.frame("RNAseqID" = names(vst_counts[my_gene, ]),
+                      "expression" = vst_counts[my_gene, ]) %>%
+  merge(col_data, by = "RNAseqID")
+
+df_plot$Disease.traj <- factor(df_plot$Disease.traj, 
+                               levels = c("Healthy","Complicated (incremental)",
+                                        "Critical","Complicated with hyperinflammatory syndrom",
+                                        "Complicated (recovering)","Mild (recovering)",
+                                        "recovery/asymptomatic","Recovered"), 
+                               ordered = T)
+
+pseudotime_colors <- c("#A7A9AC","#E84F8C", "#7031B9", "#A04E9E", "#E65826", "#F99B1C", "#FDC077", "#51BBFE")
+
+df_mean <- df_plot %>%
+  split(~ .$Sex + .$Pseudotime) %>%
+  map_dbl(function(x){mean(x$expression)}) %>%
+  data.frame(names(.) %>% str_split("[.]") %>% map_dfr(.f = function(x){data.frame(t(x))}), "Mean" = .)
+
+df_mean <- df_plot %>%
+  group_by(Sex, Disease.traj) %>%
+  dplyr::summarize("mean" = mean(expression))
+
+plot_expression <- ggplot(df_plot, aes(x = Disease.traj, y = expression, color = Disease.traj, fill = Disease.traj)) +
+  geom_boxplot(alpha = 0.5) +
+  geom_point(position = position_jitter(height = 0)) +
+  facet_grid(. ~ Sex, scales = "free_y", switch = "y") +
+  geom_point(data = df_mean, aes(x = Disease.traj, y = mean, color = Disease.traj, fill = Disease.traj), size = 2.5, shape = 5) +
+  geom_line(data = df_mean, aes(x = Disease.traj, y = mean, group = 1), linewidth = 0.5, color = "black", linetype = "dashed") +
+  scale_fill_manual(values = pseudotime_colors) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(y = "Normalized expression", title = my_symbol, fill = "Pseudotime", color = "Pseudotime") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        strip.placement = "outside",
+        legend.position = "right",
+        strip.background.y = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white"))
+
+plot_expression
+ggsave(plot_expression, filename = paste0(folder, "boxplot_", my_symbol, ".png"), width = 5, height = 3)
+```
+
+TASK
+
+* Plot the expression of the genes MTATP6P1, FAM20A, and ARL16 in turn using the code above. Which of the three tests (male, female, interaction) do you expect to be significant? 
+
+* Below, you can find code chunks that filter for three different kinds of interaction patterns. From which of these groups were the three genes MTATP6P1, FAM20A, and ARL16 taken? Try to assign them to the respective group by understanding the code and comparing it to the expression pattern. You can verify your guess by searching the gene in the respective table.
+
+
+```{r}
+selected_genes_1 <- res_interaction %>%
+  subset(.$padj_f < 0.05) %>%
+  subset(.$padj_m < 0.05)%>%
+  subset(.$padj < 0.05) %>%
+  subset(sign(.$log2FoldChange_f) == sign(.$log2FoldChange_m))
+
+selected_genes_2 <- res_interaction %>%
+  subset(.$padj_f < 0.05) %>%
+  subset(.$padj_m < 0.05)%>%
+  subset(.$padj < 0.05) %>%
+  subset(sign(.$log2FoldChange_f) != sign(.$log2FoldChange_m))
+
+selected_genes_3 <- res_interaction %>%
+  subset(.$padj_f > 0.05) %>%
+  subset(.$padj_m < 0.05)%>%
+  subset(.$padj < 0.05)
+```
+
+
+
+### Downstream analysis - Functional enrichement
+
+The DGE analysis approaches we just explored give us lists with differentially expressed genes under different hypotheses. As you have seen, these lists can be quite large and encompass up to thousands of genes. To better understand the results and give us potential leads to pursue further, we can identify the biological processes that the DEGs are involved in. One way to test this is through overrepresentation analysis, where we use curated and predefined sets of genes that reflect signaling pathways (databases for these include "Gene Ontology", "KEGG" or "Hallmark") and test if our DEGs are enriched in these. 
+
+We will perform such an enrichment analysis for the results of the sex-stratified analysis. First, we load the DGE results tables.
+
+```{r}
+#load the results from both comparisons
+res_table_5_0_f <- read.table(file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5_f.txt", sep = '')), sep = "\t")
+res_table_5_0_m <- read.table(file = file.path(folder, paste("DESeq2result_Control_vs_COVID_5_m.txt", sep = '')), sep = "\t")
+
+#define DEGs and merge result tables
+res_table_5_0_f <- res_table_5_0_f %>%
+  add_column("direction" = case_when(.$log2FoldChange > 1 & .$padj < 0.05 ~ "up", 
+                                     .$log2FoldChange < -1 & .$padj < 0.05 ~ "down",
+                                     .default = "not significant"), 
+             .after = "padj")
+
+res_table_5_0_m <- res_table_5_0_m %>%
+  add_column("direction" = case_when(.$log2FoldChange > 1 & .$padj < 0.05 ~ "up", 
+                                     .$log2FoldChange < -1 & .$padj < 0.05 ~ "down",
+                                     .default = "not significant"), 
+             .after = "padj")
+```
+
+Now we can test for enrichment for our different sets of DEGs using the GO database. We will perform an enrichment analysis for COVID-response genes in females and males separated by up- and downregulation.
+
+```{r}
+my_group <- c("m", "f")
+my_direction <- c("up", "down")
+
+for(g in 1:length(my_group)){
+  for(d in 1:length(my_direction)){
+  
+    #filter DEGs
+    if(my_group[g] == "m"){
+      df_degs <- res_table_5_0_m
+    }else if(my_group[g] == "f"){
+      df_degs <- res_table_5_0_f
+    }
+
+    degs <- df_degs %>%
+      subset(.$direction == my_direction[d]) %>%
+      .$Gene_id %>%
+      unique()
+    
+    #set universe set and test set
+    gene_universe <- df_degs$Gene_id
+    geneList <- factor(as.integer(gene_universe %in% degs))
+    names(geneList) <- gene_universe
+    
+    #run enrichment
+    GOdata <- new("topGOdata",
+                  ontology = "BP",
+                  allGenes = geneList,
+                  geneSel = function(x) x == 1,
+                  annot = annFUN.org,
+                  mapping = "org.Hs.eg.db",
+                  ID = "ensembl",
+                  nodeSize = 5)
+    
+    result_fisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+    go_results <- GenTable(GOdata, 
+                           classicFisher = result_fisher, 
+                           orderBy = "classicFisher", 
+                           topNodes = 20)
+    go_results$classicFisher <- as.numeric(gsub("< ", "", go_results$classicFisher))
+
+    #save results
+    file_filtered <- paste0(folder, "GOterms_DEGs_", my_group[g], "_", my_direction[d], ".csv")
+    write.csv(go_results, file_filtered, row.names = FALSE)
+  }
+}
+```
+
+Have a look at the output table for upregulated DEGs in males.
+
+```{r}
+go_results <- read.csv(paste0(folder, "GOterms_DEGs_m_up.csv"))
+view(go_results)
+```
+
+Plot the significant terms.
+
+```{r, fig.height=3, fig.width=5}
+go_results$Term <- factor(go_results$Term, levels = rev(go_results$Term))
+
+ggplot(go_results[1:15, ], aes(x = Term, y = -log10(classicFisher))) +
+  geom_col(fill = "black") +
+  coord_flip() +
+  labs(x = NULL, y = "-log10(p-value)",
+       title = paste("Top enriched GO terms")) +
+  theme_bw()
+```
+
+TASK
+
+* Load the GO results table for upregulated DEGs in females and plot the significant terms. 
+

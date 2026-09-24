@@ -1,0 +1,598 @@
+---
+title: "RNA-Seq Hands-on: Variance Partition Analysis"
+author: "Franziska Kimmig"
+date: "09/29/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## RNA-Seq Hands-on - Variance partition analysis
+
+Our next goal is to understand the different sources of variation and their magnitude in our transcriptome data on the gene-level. While Principal-Component Analysis captures differences on the patient-level by comparing the whole transcriptome profiles of the individuals, we now want to understand how much influence different factors such as disease status, time since onset etc. have on the expression of each gene. To achieve this, we will perform a variance partition analysis. Here, a linear (mixed) model including the factors we are interested in will be fitted for each gene separately on its expression counts giving the proportion of variance of the expression explained by each of the factors.
+
+More detailed information you can find in the vignette of the package (https://www.bioconductor.org/packages/release/bioc/vignettes/variancePartition/inst/doc/variancePartition.html#running-an-analysis)
+
+
+### Setup
+
+First let's load the necessary external libraries.
+
+```{r, results='hide', message=FALSE}
+library(tidyverse)
+library(reshape2)
+library(DESeq2)
+library(variancePartition)
+
+folder <- "output_varPart/"
+
+if (!dir.exists(folder)){
+  dir.create(folder)
+}
+```
+
+
+Now we load the data and bring it into a format that we can run the analysis functions on. 
+
+```{r}
+##Read sample info file
+covid_info_file <- read.csv("input/Sequenced_sample_metadata_020720.csv")
+covid_info_file$Pseudotime <- as.character(covid_info_file$Pseudotime)
+
+##Read raw count file
+count_data <- read.csv("input/COVID_control_raw_counts_070720.txt", sep = '\t')
+count_data <- count_data[, as.character(covid_info_file$RNAseqID)]
+
+##Format sample col data, the patient data
+col_data <- covid_info_file
+rownames(col_data) <- col_data$RNAseqID
+#col_data$Sex <- as.factor(col_data$Sex)
+#col_data$Disease.traj <- as.factor(col_data$Disease.traj)
+#col_data$Pseudotime <- as.factor(as.character(col_data$Pseudotime))
+
+#Read the file that maps gene Ensembl ID to gene name so that we can understand the genes better later on
+ensg2gene <- read.table("input/gencode_v25_gene_info.txt", header = T)
+unique_ensg2gene <- subset(ensg2gene, duplicated(ensg2gene$Gene_id) == FALSE)
+rownames(unique_ensg2gene) <- unique_ensg2gene$Gene_id
+```
+
+For this analysis we will load additional information on the samples including different lab values.
+
+```{r}
+#Read additional sample info file
+covid_clinical_data <- read.csv("input/Clinical_data_sampling_points.csv")
+
+#merge with existing metadata
+col_data_extended <- col_data %>%
+  merge(covid_clinical_data[, c(8, 10:27)], by = c("Name"), all = TRUE, sort = FALSE)
+col_data_extended <- col_data_extended[match(col_data$RNAseqID, col_data_extended$RNAseqID), ]
+
+all(col_data_extended$RNAseqID == colnames(count_data)) #TRUE
+col_data <- col_data_extended
+```
+
+
+
+### Variable selection
+
+The first step of the variance partition analysis is to decide on the set of variables we want to include in our model. This depends on the research question we want to answer as well as on the structure of our data and experimental setup.  
+
+Look up the available clinical and demographic variables.
+
+```{r}
+colnames(col_data)
+```
+
+TASK: Discuss which variables should be included in the model considering that we are working
+  1. with bulk data from blood,
+  2. on COVID-19 infection,
+  3. with a longitudinal dataset.
+
+
+For strongly correlated variables, multiple regression methods like variancePartition will divide the variance across these related variables. For example sex and ferritin are correlated, so that including ferritin additionally to sex in the model will reduce the variance explained by sex. We will need to consider this in selecting the variables for our model and for our interpretation of the results later.
+
+Compute and plot the pairwise correlations between our chosen variables.
+
+```{r, fig.height=6, fig.width=8}
+#Define the model by adding all variables that we want to check for correlation
+form <- ~ (1|PatientID) + (1|Sex) + Age + (1|Pseudotime) + D.Dimers + White.blood.cells + Neutrophils + Lymphocytes + Hematokrit + Platelet + CRP + IL6 + Ferritin + Glucose + Troponin.T +  Thrombopoetin + antiviral.IgA + antiviral.IgG
+
+#compute the canonical correlation between variables
+Corr_mat <- canCorPairs(form, col_data) %>%
+  as.data.frame() %>%
+  add_column("Components" = rownames(.)) %>%
+  melt(id.vars = "Components")
+
+Corr_mat$Components <- factor(Corr_mat$Components, levels = c("PatientID", "Sex", "Age", "Pseudotime", "White.blood.cells", "Neutrophils", "Lymphocytes", "Platelet", "D.Dimers", "Hematokrit", "CRP", "IL6", "Ferritin", "Glucose", "Troponin.T", "Thrombopoetin", "antiviral.IgA", "antiviral.IgG"))
+
+Corr_mat$variable <- factor(Corr_mat$variable, levels = levels(Corr_mat$Components))
+
+plot_corr <- ggplot(Corr_mat, aes(x = variable, y = Components, color = value, fill = value, size = value)) +
+  geom_point(shape = 21) +
+  scale_size(range = c(1, 7)) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#2171B5") +
+  scale_color_gradient(low = "#F7FBFF", high = "#2171B5") +
+  labs(fill = "Canonical\ncorrelation", color = "Canonical\ncorrelation", size = "Canonical\ncorrelation", x = NULL, y = NULL) +
+  theme_bw() +
+  theme(legend.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_text(size = 10),
+        panel.border = element_rect(color = "grey"),
+        axis.text = element_text(size = 12)) +
+  coord_equal()
+
+plot_corr
+ggsave(plot_corr, filename = paste0(folder, "correlation_metadata.png"), width = 8, height = 6)
+```
+
+TASK:
+
+* What is the difference between fixed and random effect and which variables should be modeled how? Check the vignette of the package ("https://www.bioconductor.org/packages/release/bioc/vignettes/variancePartition/inst/doc/variancePartition.html")
+
+* Have a closer look at the correlation plot. Which variables are strongly correlated?
+
+Note: Model estimates can become unstable when highly co-linear variables are included. These cases are flagged by the package and can be resolved by dropping one of the co-linear variables.
+
+
+As none of the variables show a worrisome high correlation, we can select a preliminary set of variables.
+
+```{r}
+selected_variables <- c("PatientID", "Sex", "Age", "Pseudotime", "White.blood.cells", "Neutrophils", "Lymphocytes", "Platelet", "D.Dimers", "Hematokrit", "CRP", "IL6", "Ferritin", "Glucose", "Troponin.T", "Thrombopoetin", "antiviral.IgA", "antiviral.IgG")
+```
+
+
+Finally, we need to make sure that we have enough power for the analysis. Check the number of samples with a full dataset regarding the variables chosen for the model and investigate how many missing values the different variables have. 
+
+```{r}
+#compute number of NAs for each variable
+test_sub <- col_data[, selected_variables] %>%
+  apply(function(x){sum(is.na(x))}, MARGIN = 2) %>%
+  data.frame("Variable" = names(.), "NAs" = .)
+
+#subset to samples with no NAs in the chosen variables
+col_data[, selected_variables] %>%
+  na.omit() %>%
+  nrow()
+```
+
+TASK
+
+* Which variable has the highest number of NAs?
+
+* How many samples with complete metadata do we have?
+
+
+Based on the completeness of our clinical data and research focus, we will reduce the set of variables to retain a reasonable number of samples with complete metadata.
+
+```{r}
+selected_variables <- c("PatientID", "Sex", "Age", "Pseudotime", "White.blood.cells", "Platelet", "Hematokrit", "CRP", "IL6", "Ferritin")
+
+col_data[, selected_variables] %>%
+  na.omit() %>%
+  nrow()
+```
+
+
+
+### Run variance partition 
+
+As before, we will use the normalized and variance-stabilized expression counts.
+
+```{r}
+dds_counts <- DESeqDataSetFromMatrix(countData = count_data, colData = col_data, design = ~ Pseudotime)
+dds_counts <- dds_counts[ rowSums(counts(dds_counts)) > 1, ]
+dds_counts <- estimateSizeFactors(dds_counts)
+
+vst_counts <- vst(dds_counts, blind = TRUE)
+vst_counts <- assay(vst_counts)
+```
+
+
+We also need to scale and center our continuous variables and factorize our categorical variables.
+
+```{r}
+#Divide the model variables into vector (= random effects) and factor (= fixed effects) variables
+my_vectors <-  c("Age")
+my_factors <-  c("PatientID")
+
+scaled_col_data <- col_data
+
+#subset to samples with a full dataset
+rownames(scaled_col_data) <- scaled_col_data$RNAseqID
+scaled_col_data <- scaled_col_data[, selected_variables]
+scaled_col_data <- na.omit(scaled_col_data)
+
+#bring metadata variables into right format
+scaled_col_data[, my_vectors] <- scale(scaled_col_data[, my_vectors])
+scaled_col_data[, my_factors] <- lapply(scaled_col_data[, my_factors], factor)
+```
+
+TASK
+
+* add the remaining variables from the vector `selected_variables` ("Sex", "White.blood.cells", "Platelet", "Hematokrit", "CRP", "IL6", "Ferritin", "Pseudotime") to either the fixed or random effect vectors and rerun the code chunk.
+
+* What does the function `scale` do? Run `?scale` in the console.
+
+
+As our gene expression filter is relatively loose, we will additionally filter for genes with non-negligible expression variation. There are different measures we can use such as variance or median absolute deviation (MAD).
+
+```{r}
+#subset counts to included samples
+vst_counts_varPart <- vst_counts[, rownames(scaled_col_data)]
+
+#compute expression variance and MAD
+gene_mad <- vst_counts_varPart %>%
+  apply(mad, MARGIN = 1)
+gene_var <- data.frame("Gene_id" = names(gene_mad), 
+                       "mad" = gene_mad, 
+                       "var" = rowVars(vst_counts_varPart))
+
+#add gene info
+gene_var <- gene_var %>%
+  merge(unique_ensg2gene, by = "Gene_id")
+write.table(gene_var, paste0(folder, "table_expression_variance_MAD.txt"), quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+TASK
+
+* What is the difference between variance and MAD?
+
+* Which group of genes do you expect to have the highest expression variance? Sort the table `gene_var` by variance values. What do you notice? How does it compare to the highest MAD values?
+
+
+We will now decide on a variation cutoff.
+
+```{r}
+#plot distribution of expression MAD
+gene_var <- gene_var[order(gene_var$mad, decreasing = TRUE), ]
+gene_var$Seq <- 1:nrow(gene_var)
+
+ggplot(gene_var, aes(x = Seq, y = mad)) + 
+  geom_line() + 
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  scale_y_log10() +
+  labs(x = "Genes", y = "log(expression variance)") +
+  theme_bw()
+
+#subset counts to included only high MAD genes
+selected_genes <- gene_var %>%
+  subset(.$mad >= 0.5)
+write.table(selected_genes, paste0(folder, "table_expression_MAD_0.5.txt"), quote = FALSE, sep = "\t", row.names = FALSE)
+
+vst_counts_varPart <- vst_counts_varPart[selected_genes$Gene_id, ]
+write.table(vst_counts_varPart, paste0(folder, "vst_counts_MAD_0.5.txt"), quote = FALSE, sep = "\t", row.names = TRUE)
+```
+
+TASK
+
+* How many genes have an expression MAD >= 0.5? Change the code to also check the number of genes with expression MAD >=0.25 and >=1.
+
+
+Now we are ready to compute the actual variance partition. We will save the fitted model so that we can extract any information at a later stage without needing to rerun the analysis.
+
+```{r}
+#Define the final model
+form <- ~ (1|PatientID) + (1|Sex) + Age + White.blood.cells + Hematokrit + Platelet + CRP + IL6 + Ferritin + (1|Pseudotime) 
+
+#Run variancePartition and save the results
+varPart_model <- fitVarPartModel(vst_counts_varPart, form, scaled_col_data)
+#varPart <- fitExtractVarPartModel(vst_counts_varPart, form, scaled_col_data)
+save(varPart_model, file = paste0(folder, "variancePartition_result.RData"))
+
+varPart <- extractVarPart(varPart_model)
+varPart_sorted <- varPart %>%
+  .[, order(colMeans(.), decreasing = TRUE)]
+write.table(varPart_sorted, paste0(folder, "variancePartition_result.txt"), quote = FALSE, sep = "\t")
+```
+
+TASK
+
+* Have a look at the object varPart. Which information does it contain.
+
+* Have a look at varPart_sorted. What are its dimensions? How does it compare to PCA results? 
+
+
+
+### Interpret the results
+
+Now it is time to interpret and visualize the results. Load the output and take a moment to familiarize yourself with it.
+
+```{r}
+#load(paste0(folder, "variancePartition_result.RData"))
+varPart <- read.table(paste0(folder, "variancePartition_result.txt"), sep = "\t")
+View(varPart)
+```
+
+TASK:
+
+* Look up which gene has the highest variance in its expression explained by sex. Use the table `unique_ensg2gene` to find out its symbol and the chromosome on which it lies.
+
+
+We can sum up the values in the result table for each gene across all variables. What do you notice?
+
+```{r}
+df_sum <- rowSums(varPart)
+head(df_sum)
+```
+
+
+To get an overview of importance of the different variables, let's first have a look at the average variance explained by each variable. Which variables do you expect to explain the most variance on average?
+
+```{r, fig.height=4, fig.width=5}
+df_plot_mean <- data.frame("Variable" = names(colMeans(varPart)), 
+                           "mean" = colMeans(varPart)*100) %>%
+  .[order(.$mean, decreasing = TRUE), ] %>%
+  subset(.$Variable != "Residuals")
+
+df_plot_mean$Variable <- factor(df_plot_mean$Variable, levels = df_plot_mean$Variable)
+
+plot_meanVar <- ggplot(df_plot_mean, aes(x = Variable, y = mean, fill = Variable)) +
+  geom_bar(alpha = 0.8, stat = "identity", color = "darkgrey") +
+  labs(y = "Mean variation explained (%)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+plot_meanVar
+ggsave(plot_meanVar, filename = paste0(folder, "barplot_mean_variation.png"), width = 5, height = 4)
+```
+
+
+Next we can have a closer look at the distribution within each variable. What does each dot represent in the violin plot?
+
+```{r, fig.height=4, fig.width=6}
+df_plot <- varPart %>%
+  rownames_to_column("Gene_ID") %>%
+  melt(id.vars = "Gene_ID")
+df_plot$variable <- factor(df_plot$variable)
+df_plot$value <- df_plot$value * 100
+
+plot_violin <- ggplot(df_plot, aes(x = variable,  y = value, fill = variable)) +
+  geom_violin(trim = FALSE, alpha = 1, scale = "width") +
+  geom_boxplot(width = 0.07, fill = "grey") +
+  labs(y = "Variance explained (%)") +
+  ylim(c(0, 100)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+plot_violin
+ggsave(plot_violin, filename = paste0(folder, "violinplot_variation.png"), width = 6, height = 4)
+```
+
+
+Replot the figure after excluding genes from the X and Y chromosome. What changes?
+
+```{r, fig.height=4, fig.width=6}
+#select all autosomal genes
+autosomal_genes <- unique_ensg2gene %>%
+  subset(! .$Chr %in% c("chrX", "chrY"))
+
+df_plot <- varPart %>%
+  rownames_to_column("Gene_ID") %>%
+  melt(id.vars = "Gene_ID") %>%
+  subset(.$Gene_ID %in% autosomal_genes$Gene_id) #this line filters our plotting data for autosomal genes
+
+df_plot$variable <- factor(df_plot$variable)
+df_plot$value <- df_plot$value * 100
+
+plot_violin <- ggplot(df_plot, aes(x = variable,  y = value, fill = variable)) +
+  geom_violin(trim = FALSE, alpha = 1, scale = "width") +
+  geom_boxplot(width = 0.07, fill = "grey") +
+  labs(y = "Variance explained (%)") +
+  ylim(c(0, 100)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+plot_violin
+ggsave(plot_violin, filename = paste0(folder, "violinplot_variation_autosomalGenes.png"), width = 8, height = 6)
+```
+
+
+
+Let's investigate which genes show a high proportion of variance explained by different variables like sex and disease severity. First, we will have a look at pseudotime.
+
+```{r, fig.height=4, fig.width=6}
+my_variable <- "Pseudotime"
+
+#For the chosen variable we will sort the genes by variance explained from highest to lowest and extract the top 10 genes with highest variance explained by the variable.
+df_variable <- varPart %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene[, c("Gene_name", "Gene_id")], by = "Gene_id") %>%
+  .[order(.[[my_variable]], decreasing = TRUE), ] %>%
+  .[1:10, ]
+  
+df_plot <- df_variable  %>%
+  melt(id.vars = c("Gene_id", "Gene_name")) 
+  
+df_plot$Gene_name <- factor(df_plot$Gene_name, levels = df_variable$Gene_name %>% rev())
+df_plot$variable <- factor(df_plot$variable, levels = levels(df_plot$variable) %>% rev())
+
+plot_top_10 <- ggplot(df_plot, aes(x = value, y = Gene_name)) +
+  geom_bar(position = "stack", stat = "identity", aes(fill = variable), color = "black") +
+  labs(x = "Proportion of variance", y = "Gene") +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.border = element_blank(),
+        legend.title = element_blank())
+
+plot_top_10
+ggsave(plot_top_10, filename = paste0(folder, "variance_partiton_example_genes_", my_variable, ".png"), width = 6, height = 4)
+```
+
+We can also have a look at the actual expression of the genes and how it is related to the different variables. Let's have a look at the expression of one of the top genes, VWCE, across pseudotimes.
+
+```{r, fig.height=3, fig.width=6}
+my_symbol <- "VWCE"
+my_gene <- unique_ensg2gene[unique_ensg2gene$Gene_name == my_symbol, "Gene_id"] %>%
+  str_sub(1, 15)
+
+df_plot <- data.frame("RNAseqID" = names(vst_counts_varPart[my_gene, ]),
+                      "expression" = vst_counts_varPart[my_gene, ]) %>%
+  merge(col_data, by = "RNAseqID")
+
+df_plot$Disease.traj <- factor(df_plot$Disease.traj, 
+                               levels = c("Healthy","Complicated (incremental)",
+                                        "Critical","Complicated with hyperinflammatory syndrom",
+                                        "Complicated (recovering)","Mild (recovering)",
+                                        "recovery/asymptomatic","Recovered"), 
+                               ordered = T)
+
+pseudotime_colors <- c("#A7A9AC","#E84F8C", "#7031B9", "#A04E9E", "#E65826", "#F99B1C", "#FDC077", "#51BBFE")
+
+plot_expression <- ggplot(df_plot, aes(x = Disease.traj, y = expression, color = Disease.traj, fill = Disease.traj)) +
+  geom_boxplot(alpha = 0.5) +
+  geom_point(position = position_jitter(height = 0)) +
+  #facet_grid(. ~ Sex, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = pseudotime_colors) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(y = "Normalized expression", title = my_symbol, fill = "Pseudotime", color = "Pseudotime") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        strip.placement = "outside",
+        legend.position = "right",
+        strip.background.y = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white"))
+
+plot_expression
+ggsave(plot_expression, filename = paste0(folder, "boxplot_", my_symbol, ".png"), width = 6, height = 3)
+```
+TASK
+
+* What is known about VWCE in the context of COVID-19 infections?
+
+* Change the code to have a look at the expression of other top genes.
+
+
+Next, lets have a look at ferritin. This has been shown to be a predictor of disease severity both in male and female COVID patients, but with different base values. (doi:10.1016/j.jinf.2020.10.012)
+
+```{r, fig.height=4, fig.width=6}
+my_variable <- "Ferritin"
+
+#For the chosen variable we will sort the genes by variance explained from highest to lowest and extract the top 10 genes with highest variance explained by the variable.
+df_variable <- varPart %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene[, c("Gene_name", "Gene_id")], by = "Gene_id") %>%
+  .[order(.[[my_variable]], decreasing = TRUE), ] %>%
+  .[1:10, ]
+  
+df_plot <- df_variable  %>%
+  melt(id.vars = c("Gene_id", "Gene_name")) 
+  
+df_plot$Gene_name <- factor(df_plot$Gene_name, levels = df_variable$Gene_name %>% rev())
+df_plot$variable <- factor(df_plot$variable, levels = levels(df_plot$variable) %>% rev())
+
+plot_top_10 <- ggplot(df_plot, aes(x = value, y = Gene_name)) +
+  geom_bar(position = "stack", stat = "identity", aes(fill = variable), color = "black") +
+  labs(x = "Proportion of variance", y = "Gene") +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.border = element_blank(),
+        legend.title = element_blank())
+
+plot_top_10
+ggsave(plot_top_10, filename = paste0(folder, "variance_partiton_example_genes_", my_variable, ".png"), width = 6, height = 4)
+```
+
+Expression of S100A7 seems to be associated with both ferritin levels and sex. Let's have a look at the expression.
+
+```{r, fig.height=4, fig.width=4}
+my_symbol <- "S100A7"
+my_gene <- unique_ensg2gene[unique_ensg2gene$Gene_name == my_symbol, "Gene_id"] %>%
+  str_sub(1, 15)
+
+df_plot <- data.frame("RNAseqID" = names(vst_counts_varPart[my_gene, ]),
+                      "expression" = vst_counts_varPart[my_gene, ]) %>%
+  merge(col_data, by = "RNAseqID")
+
+plot_expression <- ggplot(df_plot, aes(x = Ferritin, y = expression)) +
+  geom_point() +
+  scale_fill_manual(values = pseudotime_colors) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(y = "Normalized expression", title = my_symbol, fill = "Sex", color = "Sex") +
+  theme_bw() +
+  theme(strip.placement = "outside",
+        legend.position = "right",
+        strip.background.y = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white"))
+        
+plot_expression
+ggsave(plot_expression, filename = paste0(folder, "boxplot_", my_symbol, ".png"), width = 4, height = 4)
+```
+
+We can also plot the expression for males and females separately. 
+
+```{r, fig.height=4, fig.width=6}
+my_symbol <- "S100A7" 
+my_gene <- unique_ensg2gene[unique_ensg2gene$Gene_name == my_symbol, "Gene_id"] %>%
+  str_sub(1, 15)
+
+df_plot <- data.frame("RNAseqID" = names(vst_counts_varPart[my_gene, ]),
+                      "expression" = vst_counts_varPart[my_gene, ]) %>%
+  merge(col_data, by = "RNAseqID")
+
+plot_expression <- ggplot(df_plot, aes(x = Ferritin, y = expression)) +
+  geom_point() +
+  facet_grid(. ~ Sex, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = pseudotime_colors) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(y = "Normalized expression", title = my_symbol, fill = "Sex", color = "Sex") +
+  theme_bw() +
+  theme(strip.placement = "outside",
+        legend.position = "right",
+        strip.background.y = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white"))
+        
+plot_expression
+ggsave(plot_expression, filename = paste0(folder, "boxplot_", my_symbol, "_sex.png"), width = 6, height = 4)
+```
+
+TASK
+
+* Have a look at the publication *doi:10.1016/j.jinf.2020.10.012*. Does the information conveyed by the plot match with the literature?
+
+
+Lastly, we will investigate genes affected by sex.
+
+```{r, fig.height=4, fig.width=6}
+my_variable <- "Sex"
+
+#For the chosen variable we will sort the genes by variance explained from highest to lowest and extract the top 10 genes with highest variance explained by the variable.
+df_variable <- varPart %>%
+  add_column("Gene_id" = rownames(.)) %>%
+  merge(unique_ensg2gene[, c("Gene_name", "Gene_id")], by = "Gene_id") %>%
+  .[order(.[[my_variable]], decreasing = TRUE), ] %>%
+  .[1:10, ]
+
+df_plot <- df_variable  %>%
+  melt(id.vars = c("Gene_id", "Gene_name")) 
+  
+df_plot$Gene_name <- factor(df_plot$Gene_name, levels = df_variable$Gene_name %>% rev())
+df_plot$variable <- factor(df_plot$variable, levels = levels(df_plot$variable) %>% rev())
+
+plot_top_10 <- ggplot(df_plot, aes(x = value, y = Gene_name)) +
+  geom_bar(position = "stack", stat = "identity", aes(fill = variable), color = "black") +
+  labs(x = "Proportion of variance", y = "Gene") +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.border = element_blank(),
+        legend.title = element_blank())
+
+plot_top_10
+ggsave(plot_top_10, filename = paste0(folder, "variance_partiton_example_genes_", my_variable, ".png"), width = 6, height = 4)
+```
+
+TASK
+
+* Do you recognize any of the gene names from our QC hands-on session?
+
+* Change the code to plot only genes on autosomal chromosomes. 
+
+

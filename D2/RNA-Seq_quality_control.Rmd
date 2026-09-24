@@ -1,0 +1,491 @@
+---
+title: "RNA-Seq Hands-on: Quality control"
+author: "Franziska Kimmig"
+date: "09/29/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This tutorial is meant to show you the basics of sex-sensitive bulk tissue RNA-Seq analysis. This is the roadmap for today:
+
+1. Setup R environment
+2. Quality control and exploratory data analysis with PCA
+3. Variance partition analysis
+4. Differential expression analysis
+5. Gene co-expression analysis
+
+
+Let's briefly review the terminology:
+
+* *bulk tissue* as opposed to *single-cell* means that a tissue sample consisting of many cells and possibly different cell types was analyzed. The tissue used here is blood.
+* *differential expression* means that the relative abundance of many types of transcripts is compared between samples. Here we compare samples of healthy donors and patients infected with COVID-19 in different stages of the disease.
+
+
+A note for later: Some of the analyses can be computationally heavy. If your laptop takes more than 3 minutes for a function call to finish, cancel it using the escape key and then skip to the next section. You can find all intermediate results in the folder `intermediate_files` and the code chunks to load them are always included at the beginning of a section. In either case it is good practice to save intermediate results for later analyses.
+
+
+
+
+## Initialize R environment
+
+Install all necessary external libraries.
+
+```{r, results='hide', message=FALSE}
+#general
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+if (!requireNamespace("tidyverse", quietly = TRUE))
+    install.packages("tidyverse")
+if (!requireNamespace("reshape2", quietly = TRUE))
+    install.packages("reshape2")
+if (!requireNamespace("DESeq2", quietly = TRUE))
+    BiocManager::install("DESeq2")
+
+#functional enrichment
+if (!requireNamespace("topGO", quietly = TRUE))
+    BiocManager::install("topGO")
+if (!requireNamespace("genefilter", quietly = TRUE))
+    BiocManager::install("genefilter")
+if (!requireNamespace("geneplotter", quietly = TRUE))
+    BiocManager::install("geneplotter")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+    BiocManager::install("org.Hs.eg.db")
+
+#visualizations
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE))
+    BiocManager::install("ComplexHeatmap")
+if (!requireNamespace("RColorBrewer", quietly = TRUE))
+    install.packages("RColorBrewer")
+if (!requireNamespace("circlize", quietly = TRUE))
+    install.packages("circlize")
+if (!requireNamespace("ggrepel", quietly = TRUE))
+    install.packages("ggrepel")
+if (!requireNamespace("ggvenn", quietly = TRUE))
+    install.packages("ggvenn")
+if (!requireNamespace("ggpubr", quietly = TRUE))
+    install.packages("ggpubr")
+
+#variance partition
+if (!requireNamespace("variancePartition", quietly = TRUE))
+    BiocManager::install("variancePartition")
+```
+
+
+
+
+## RNA-Seq Hands-on - Quality control
+
+### Setup
+
+First, load the packages that we will be working with in this session and prepare the output folder that we will use to save our results.
+
+```{r, message=FALSE}
+library(reshape2)
+library(tidyverse)
+library(ggrepel)
+library(DESeq2)
+library(variancePartition)
+
+folder <- "output_QC/"
+
+if (!dir.exists(folder)){
+  dir.create(folder)
+}
+```
+
+
+### Read files and preprocess the data
+
+Before the tutorial, we have run the RNA-Seq pre-processing pipeline for you. The result is a *count table*, with sample IDs (blood samples from the patients) as columns, gene IDs as rows, and read counts as the values. From the clinics, we know who of those patients was diagnosed with COVID-19, and how severe their status was (*metadata*). This data is saved as tables in the project folder you downloaded.
+
+We now load the data and bring it into a format that we can run the analysis functions on. 
+
+```{r}
+##Read sample info file
+covid_info_file <- read.csv("input/Sequenced_sample_metadata_020720.csv")
+covid_info_file$Pseudotime <- as.character(covid_info_file$Pseudotime)
+
+##Read raw count file
+count_data <- read.csv("input/COVID_control_raw_counts_070720.txt", sep = '\t')
+count_data <- count_data[, as.character(covid_info_file$RNAseqID)]
+
+##Format sample col data, the patient data
+col_data <- covid_info_file
+rownames(col_data) <- col_data$RNAseqID
+col_data$Sex <- as.factor(col_data$Sex)
+col_data$Disease.traj <- as.factor(col_data$Disease.traj)
+col_data$Pseudotime <- as.factor(as.character(col_data$Pseudotime))
+
+#Read the file that maps gene Ensembl ID to gene name so that we can understand the genes better later on
+ensg2gene <- read.table("input/gencode_v25_gene_info.txt", header = T)
+unique_ensg2gene <- subset(ensg2gene, duplicated(ensg2gene$Gene_id) == FALSE)
+rownames(unique_ensg2gene) <- unique_ensg2gene$Gene_id
+```
+
+
+
+### Understand the dataset
+
+Let's have a brief look at the count data and the sample info table to get an impression what our data actually look like. 
+
+```{r}
+head(col_data)
+head(count_data)
+```
+
+TASK
+
+* Try out the function ```View()``` on `col_data` to see the complete data. You can type your code in the grey area above.
+* Which column in `col_data` contains the IDs that are used to map the metadata to the count table?
+* Modify the code to show you the first 10 rows instead of the first 6 of the tables. Run ```?head``` if you don't know the right argument for the function.
+
+
+It is always a good idea to check if the numbers of columns and rows are as you expect. Are the number of rows in the sample info table same as the number of columns in the count table? What does the number of rows in the count table signify?
+
+```{r}
+dim(col_data)
+dim(count_data)
+```
+
+
+
+### Quality control
+
+Next we need to make sure that all our samples can be actually used in the analysis. We will check different measures of sequencing quality to determine potential technical outliers or sample swaps.
+
+First, let's check the sequencing depth, i.e. the total number of reads per sample. Samples with very few reads need to be excluded from the analysis. 
+
+```{r, fig.width=6, fig.height=4}
+df_reads <- count_data %>%
+  colSums() %>%
+  data.frame("RNAseqID" = names(.), "Reads" = .) %>%
+  .[order(.$Reads, decreasing = TRUE), ]
+
+df_reads$RNAseqID <- factor(df_reads$RNAseqID, levels = df_reads$RNAseqID)
+
+plot_reads <- ggplot(df_reads, aes(x = RNAseqID, y = Reads)) +
+  geom_col(color = "#3399FF", fill = "#3399FF", alpha = 0.4) +
+  geom_hline(yintercept = 10000000) +
+  labs(x = "Sample", y = "Number of reads") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "grey"),
+        panel.grid.major.x = element_blank())
+
+plot_reads
+ggsave(plot_reads, filename = paste0(folder, "read_distribution.png"), width = 6, height = 4)
+```
+
+Even though there is a wide range of sequencing depth, all samples were sequenced sufficiently deep to be included in the analysis.
+
+
+Next, we will check the library complexity, i.e. the number of detected features (here genes). Too low numbers or strange bumps in the distribution can indicate sequencing issues like contamination.
+
+```{r, fig.width=6, fig.height=4}
+df_genes <- count_data %>%
+  '>' (0) %>%
+  colSums() %>%
+  data.frame("RNAseqID" = names(.), "Genes" = .) %>%
+  .[order(.$Genes, decreasing = TRUE), ]
+
+df_genes$Sample_ID <- factor(df_genes$RNAseqID, levels = df_genes$RNAseqID)
+
+plot_genes <- ggplot(df_genes, aes(x = Sample_ID, y = Genes)) +
+  geom_col(color = "#3399FF", fill = "#3399FF", alpha = 0.4) +
+  geom_hline(yintercept = 10000) +
+  labs(x = "Sample", y = "Number of genes") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "grey"),
+        panel.grid.major.x = element_blank())
+
+plot_genes
+ggsave(plot_genes, filename = paste0(folder, "detectedGenes_distribution.png"), width = 6, height = 4)
+```
+
+No concerning pattern in this plot either.
+
+Lastly, we will check the expression of know sex-specific or X-Y homologous genes. This can reveal potential sample swaps for example.
+
+```{r, fig.width=12, fig.height=4}
+#Load the set of sex-specific genes (taken from https://doi.org/10.1186/s13293-020-00312-9)
+my_genes <- read.csv("input/sex_genes.csv")
+my_genes$Gene_name <- factor(my_genes$Gene_name, levels = my_genes$Gene_name)
+
+df_plot <- count_data %>%
+  as.data.frame() %>%
+  .[my_genes$Gene_ID, ] %>%
+  add_column("Gene_ID" = rownames(.)) %>%
+  merge(my_genes, by = "Gene_ID") %>%
+  melt(id.vars = c("Gene_ID", "Gene_name", "Chromosome", "Group"), variable.name = "RNAseqID") %>%
+  merge(col_data, by = "RNAseqID") 
+
+my_colors <- c("m"='#9933FF', "f"='#FF9933')
+
+plot_sex_genes <- ggplot(df_plot, aes(x = Gene_name, y = value)) +
+  geom_boxplot(width = 0.8, alpha = 0.5, aes(x = Gene_name, y = value, color = Sex, fill = Sex)) +
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = my_colors) +
+  facet_wrap(.~Group, scales = "free", strip.position = "bottom", nrow = 1) +
+  labs(y = "Expression counts", color = "Sex", fill = "Sex") +
+  theme_bw() +
+  theme(strip.placement = "outside",
+        axis.title.x = element_blank(),
+        strip.text = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(color = "grey"))
+
+plot_sex_genes
+ggsave(plot_sex_genes, filename = paste0(folder, "sex_marker_genes_boxplot.png"), width = 12, height = 4)
+```
+TASK
+
+* Which expression pattern would you expect for these genes? Does the plot match your expectation?
+
+
+Note: If you notice any suspicious samples in later analyses like PCA, you can go back to these plots and inspect the sample for potential technical reasons for the strange behavior. Samples should only be excluded from analyses if there are is evidence for underlying technical issues. Another valuable resource is the QC report from the preprocessing pipeline for example.
+
+
+
+
+### Exploratory data analysis with PCA 
+
+We would like to get an overview of our data, to see if samples from the same stage of the disease are more similar to each other than to healthy controls and understand which aspects drive the variation in our dataset on a molecular level.
+
+Principal Component Analysis (PCA) is a statistical method to reduce the dimensionality of a dataset. Here, we want to project our count data into a 2-dimensional space on our screen. The first principal component describes a vector in the real coordinate space which minimizes the average square distance of the data points to the line. Each subsequent component tries the same, but has to be orthogonal to all other vectors (<https://en.wikipedia.org/wiki/Principal_component_analysis>). 
+This means, that PCA finds the axes that explain the largest variance in the dataset. Depending on the strength of the signal, these axes will sometimes closely correspond to different technical or biological variables and an give us insights in to our data.
+
+Let's run PCA first on the raw counts to see what happens.
+
+```{r}
+##Calculate the principle components for the count table
+pc <- prcomp(t(count_data))
+
+#Extract PCs and merge with metadata
+all(col_data$Sample_ID == rownames(pc$x)) #TRUE
+df_pca <- cbind(col_data, pc$x)
+
+#check the fraction of the total variance that is captured by the principal components
+summary(pc)
+```
+
+If we visualize the results, samples with similar expression profiles will be clustered together. What do you expect to see in the PCA plot for this dataset? Which variable will be driving the differences in expression profiles? Let's first check for the different disease groups and patients.
+
+```{r, fig.height=5, fig.width=9}
+#Prepare the input data for plotting
+df_pca$Disease.traj <- factor(df_pca$Disease.traj, 
+                             levels = c("Healthy","Complicated (incremental)",
+                                        "Critical","Complicated with hyperinflammatory syndrom",
+                                        "Complicated (recovering)","Mild (recovering)",
+                                        "recovery/asymptomatic","Recovered"), 
+                             ordered = T)
+pc_variance <- pc %>%
+  summary() %>%
+  .$importance %>%
+  .["Proportion of Variance", ] %>% 
+  `*`(100) %>%
+  round(2)
+
+pseudotime_colors <- c("#A7A9AC","#E84F8C", "#7031B9", "#A04E9E", "#E65826", "#F99B1C", "#FDC077", "#51BBFE")
+plot_pca <- ggplot(df_pca, aes(x = PC1, y = PC2, color = Disease.traj)) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = PatientID)) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(x = paste0("PC1 (", pc_variance[1] %>% round(2), "% variance)"),
+       y = paste0("PC2 (", pc_variance[2]%>% round(2), "% variance)"),
+       color = "Pseudotime") +
+  theme_bw() +
+  theme(panel.border = element_rect(color = "grey"),
+        panel.grid = element_blank())
+
+plot_pca
+```
+
+The difference between COVID-cases and controls is not as obvious as we might have expected. The controls are somewhat concentrated, but not convincingly. The reason for that is that we have used raw sequencing counts for the PCA. In consequence, library depth and highly expressed genes are driving the variation.
+We can color our samples with both these variable to check if they indeed explain the first PCs.
+
+Let' first check library depth, i.e. the total number of reads of each sample. 
+
+```{r, fig.height=5, fig.width=7}
+#compute the number of reads of each sample
+df_pca <- count_data %>%
+  colSums() %>%
+  data.frame("RNAseqID" = names(.), "Reads" = .) %>%
+  merge(df_pca, by = "RNAseqID")
+
+plot_pca <- ggplot(df_pca, aes(x = PC1, y = PC2, color = Reads)) +
+  geom_point(size = 3) +
+  labs(x = paste0("PC1 (", pc_variance[1] %>% round(2), "% variance)"),
+       y = paste0("PC2 (", pc_variance[2]%>% round(2), "% variance)"),
+       color = "Pseudotime") +
+  theme_bw() +
+  theme(panel.border = element_rect(color = "grey"),
+        panel.grid = element_blank())
+plot(plot_pca)
+```
+
+Clearly, library depth correlates with PC 2. Let's check highly expressed genes next.
+
+```{r, fig.height=5, fig.width=7}
+#compute the total number of reads mapped to each gene
+df_gene_expression <- data.frame("Gene_ID" = names(rowSums(count_data)),
+                                 "expression" = rowSums(count_data)) %>%
+  merge(unique_ensg2gene, by.x = "Gene_ID", by.y = "Gene_id") %>%
+  .[order(.$expression, decreasing = TRUE), ]
+```
+
+TASK
+
+* Which gene has the highest total expression in the dataset? Look up the corresponding gene symbol in the table `unique_ensg2gene`.
+
+
+We will now color the samples by the expression of that gene.
+
+```{r, fig.height=5, fig.width=7}
+#compute the total number of reads mapped to each gene
+df_pca_v2 <- data.frame("expression" = as.data.frame(t(count_data["ENSG00000244734", ]))$ENSG00000244734,
+                     "RNAseqID" = names(count_data["ENSG00000244734", ])) %>%
+  merge(df_pca, by = "RNAseqID")
+
+plot_pca <- ggplot(df_pca_v2, aes(x = PC1, y = PC2, color = expression)) +
+  geom_point(size = 3) +
+  labs(x = paste0("PC1 (", pc_variance[1] %>% round(2), "% variance)"),
+       y = paste0("PC2 (", pc_variance[2]%>% round(2), "% variance)"),
+       color = "Pseudotime") +
+  theme_bw() +
+  theme(panel.border = element_rect(color = "grey"),
+        panel.grid = element_blank())
+plot(plot_pca)
+```
+
+The gradient from left to right indicates that highly expressed genes are driving the variation captured by PC 1, which corresponds to 98.89% of the total variation! 
+
+We can change the structure of variance in our data by applying the right normalization strategies. This will account for most technical aspects of the sequencing data and bring out the biological signals.
+
+To account for sequencing depth we use the DESeq2 normalization method. In this step we will also filter out genes with low overall expression.
+
+```{r}
+dds_counts <- DESeqDataSetFromMatrix(countData = count_data, colData = col_data, design = ~ Pseudotime)
+dds_counts <- dds_counts[ rowSums(counts(dds_counts)) > 1, ]
+dds_counts <- estimateSizeFactors(dds_counts)
+```
+
+TASK
+
+* Check how many genes remain after this filtering step. You can extract the count data with `counts(dds_counts)`.
+
+Next we account for differences in overall expression levels by applying a variance stabilizing transformation. This method puts the values on a log-scale and accounts for the trend of higher expression variation with increasing overall expression that is inherent to RNA sequencing data.
+
+```{r}
+vst_counts <- vst(dds_counts, blind = TRUE)
+vst_counts <- assay(vst_counts)
+
+write.table(vst_counts, paste0(folder, "vst_counts.txt"), quote = FALSE, sep = "\t", row.names = TRUE)
+```
+
+
+Let's rerun the PCA, using normalized and variance stabilized expression data.
+
+```{r, fig.height=5, fig.width=9}
+pc <- prcomp(t(vst_counts))
+
+#Extract PCs and merge with metadata
+all(col_data$Sample_ID == rownames(pc$x)) #TRUE
+df_pca <- cbind(col_data, pc$x)
+
+df_pca$Disease.traj <- factor(df_pca$Disease.traj, 
+                             levels = c("Healthy","Complicated (incremental)",
+                                        "Critical","Complicated with hyperinflammatory syndrom",
+                                        "Complicated (recovering)","Mild (recovering)",
+                                        "recovery/asymptomatic","Recovered"), 
+                             ordered = T)
+pc_variance <- pc %>%
+  summary() %>%
+  .$importance %>%
+  .["Proportion of Variance", ] %>% 
+  `*`(100) %>%
+  round(2)
+
+pseudotime_colors <- c("#A7A9AC","#E84F8C", "#7031B9", "#A04E9E", "#E65826", "#F99B1C", "#FDC077", "#51BBFE")
+plot_pca <- ggplot(df_pca, aes(x = PC1, y = PC2, color = Disease.traj)) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = PatientID)) +
+  scale_color_manual(values = pseudotime_colors) +
+  labs(x = paste0("PC1 (", pc_variance[1] %>% round(2), "% variance)"),
+       y = paste0("PC2 (", pc_variance[2]%>% round(2), "% variance)"),
+       color = "Pseudotime") +
+  theme_bw() +
+  theme(panel.border = element_rect(color = "grey"),
+        panel.grid = element_blank())
+
+plot_pca
+ggsave(plot_pca, filename = paste0(folder, "pc_1_2_pseudotime.png"), width = 9, height = 5)
+```
+
+TASK
+
+* Have a look at how the result changed. Does it support our hypothesis about differences between patients and controls? How much variance is now explained by PC 1 and PC 2?
+
+* Change the ggplot command above so that the points are colored by sex instead of pseudotime. 
+
+
+There are many different variables that can potentially affect the transcriptome and are relevant in our experiment. Moreover, until now we have only explored the first two PCs. To get a more structured overview of the impact of different clinical and anthropometric variables on our dataset we will compute the association between all variables of interest and the first few PCs.
+
+```{r, fig.height=5, fig.width=9}
+#We will first find out how many PCs are needed to capture more than 50% of the total variation
+summary(pc) #--> PC1 to PC5
+
+#Set the formular with all variables and PCs
+form <- ~ PatientID + Sex + Age + TimepointFromOnset + Pseudotime + PC1 + PC2 + PC3 + PC4 + PC5
+
+#Compute the pairwise canonical correlation
+my_variables <- c("PatientID", "Sex", "Age", "TimepointFromOnset", "Pseudotime")
+my_n <- 5
+
+Corr_mat <- canCorPairs(form, df_pca) %>%
+  .[paste0(rep("PC", my_n), 1:my_n), my_variables] %>%
+  as.data.frame() %>%
+  add_column("Components" = rownames(.)) %>%
+  melt(id.vars = "Components") %>%
+  add_column("value_rounded" = round(.$value, digits = 2))
+
+Corr_mat$Components <- factor(Corr_mat$Components, levels = paste0(rep("PC", my_n), 1:my_n) %>% rev())
+Corr_mat$variable <- factor(Corr_mat$variable, levels = my_variables)
+
+plot_corr <- ggplot(Corr_mat, aes(x = variable, y = Components)) +
+  geom_point(aes(color = value, fill = value, size = value), shape = 21) +
+  geom_text(aes(label = value_rounded), color = "black", size = 3) +
+  scale_y_discrete(position = "left", 
+                   breaks = paste0(rep("PC", my_n), 1:my_n), 
+                   labels = paste0(names(pc_variance[1:my_n]), "(", pc_variance[1:my_n], rep("%)", my_n))) + 
+  scale_size(range = c(1, 11), guide = "none") +
+  scale_fill_gradient(low = "white", high = "#2171B5") +
+  scale_color_gradient(low = "white", high = "#2171B5") +
+  labs(fill = "Canonical\ncorrelation", color = "Canonical\ncorrelation", size = "Canonical\ncorrelation", x = NULL, y = NULL) +
+  theme_bw() +
+  theme(legend.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_text(size = 10),
+        panel.border = element_rect(color = "grey"),
+        axis.text = element_text(size = 11)) +
+  coord_equal()
+
+plot_corr
+ggsave(plot_corr, filename = paste0(folder, "correlation_pca_metadata.png"), width = 9, height = 5)
+```
+
+TASK
+
+* Which variable is most strongly associated with PC 3? Which PCs capture variance from biological sex?
+
+* Why do the correlation values for one PC do not add up to 1?
+
+
+
