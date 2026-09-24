@@ -1,0 +1,954 @@
+---
+title: "RNA-Seq_coexpression_analysis"
+author: "Neha Mishra"
+date: "2026-09-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Learning objectives
+
+This tutorial's central theme is **sex-sensitive analysis**: most coexpression tutorials treat sex as, at best, a nuisance covariate to adjust away. Here it's the opposite — sex is a variable we investigate on purpose, at every stage, because a coexpression program (or a module's relationship to disease severity) can genuinely look different in males and females, and averaging over that difference can hide real biology or mislead about what's driving a signal.
+
+By the end of this tutorial you will be able to:
+
+-   Explain what a gene coexpression network is and why WGCNA is a useful tool to build one
+-   Go from a normalized expression matrix to a set of coexpression **modules**
+-   Choose a soft-thresholding power using the scale-free topology criterion
+-   Summarize each module with a **module eigengene** and interpret it
+-   Test whether modules are associated with clinical/phenotypic traits, with mixed models that account for repeated timepoints per patient
+-   **Test whether a module-trait relationship differs by sex** (a statistical interaction), and distinguish that from simply adjusting for sex as a covariate
+-   (Optional, advanced) Build separate coexpression networks per sex, and formally test whether modules discovered in one sex are structurally preserved in the other
+
+> This notebook expects an `input/` folder (sample metadata, gene annotation, clinical data) and an `output_QC/` folder (normalized counts) in the same directory as this `.Rmd` file — knitr uses the file's own folder as the working directory, so no `setwd()` is needed. A new `output_coexpression/` folder is created automatically to hold this tutorial's outputs.
+
+> 🧪 boxes mark a short exercise — try them before moving to the next chunk.
+
+## 0. Why analyze coexpression networks by sex?
+
+Sex differences in immune and inflammatory response are well documented (e.g. in COVID-19 severity and outcomes), yet many transcriptomic studies either exclude sex from the model entirely or only ever include it as an additive covariate — which corrects for a shift in the *average* level of a module, but can't detect or describe a difference in how strongly (or in which direction) a module tracks disease.
+
+Throughout this tutorial you'll build one shared network first (the standard workflow), then progressively ask sharper sex-specific questions of it: does sex shift a module's baseline level (a covariate), does the *relationship* between a module and a clinical trait differ by sex (an interaction), and finally, does the *network structure itself* — which genes cluster together at all — differ by sex (a structural, not just statistical, question). 
+
+## 1. Install packages
+
+Run this once per machine. Each line only installs a package if it isn't already present, so it's safe to re-run.
+
+```{r install-packages, message=FALSE, results='hide'}
+# general
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+if (!requireNamespace("tidyverse", quietly = TRUE))
+    install.packages("tidyverse")
+if (!requireNamespace("reshape2", quietly = TRUE))
+    install.packages("reshape2")
+if (!requireNamespace("matrixStats", quietly = TRUE))
+    install.packages("matrixStats")
+
+# network analysis
+if (!requireNamespace("WGCNA", quietly = TRUE))
+    BiocManager::install("WGCNA")
+
+# statistics
+if (!requireNamespace("lme4", quietly = TRUE))
+    install.packages("lme4")
+if (!requireNamespace("lmerTest", quietly = TRUE))
+    install.packages("lmerTest")
+
+# functional enrichment
+if (!requireNamespace("topGO", quietly = TRUE))
+    BiocManager::install("topGO")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+    BiocManager::install("org.Hs.eg.db")
+
+# visualizations
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE))
+    BiocManager::install("ComplexHeatmap")
+if (!requireNamespace("RColorBrewer", quietly = TRUE))
+    install.packages("RColorBrewer")
+if (!requireNamespace("circlize", quietly = TRUE))
+    install.packages("circlize")
+if (!requireNamespace("corrplot", quietly = TRUE))
+    install.packages("corrplot")
+if (!requireNamespace("viridis", quietly = TRUE))
+    install.packages("viridis")
+if (!requireNamespace("cowplot", quietly = TRUE))
+    install.packages("cowplot")
+if (!requireNamespace("patchwork", quietly = TRUE))
+    install.packages("patchwork")
+# "grid" ships with base R itself and never needs installing
+```
+
+## 2. Load packages
+
+```{r load-packages, message=FALSE}
+# general
+library(BiocManager)
+library(tidyverse)
+library(reshape2)
+library(matrixStats)
+
+# network analysis
+library(WGCNA)
+
+# statistics
+library(lme4)
+library(lmerTest)
+
+# functional enrichment
+library(topGO)
+library(org.Hs.eg.db)
+
+# visualizations
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(circlize)
+library(corrplot)
+library(viridis)
+library(cowplot)
+library(grid)
+library(patchwork)
+
+folder <- "output_coexpression/"
+if (!dir.exists(folder)) {
+  dir.create(folder)
+}
+```
+
+## 3. Load and inspect the data
+
+```{r load-data}
+# Sample metadata (one row per patient-timepoint)
+covid_info_file <- read.csv("input/Sequenced_sample_metadata_020720.csv")
+covid_info_file$Pseudotime <- as.character(covid_info_file$Pseudotime)
+
+# Variance-stabilized counts (genes x samples), already normalized upstream
+vst_counts <- read.table("output_QC/vst_counts.txt", sep = '\t', header = TRUE)
+vst_counts <- vst_counts[, as.character(covid_info_file$RNAseqID)]
+
+# Sample-level metadata, indexed by RNAseqID for easy lookup later
+col_data <- covid_info_file
+rownames(col_data) <- col_data$RNAseqID
+col_data$Gender <- as.factor(col_data$Gender)
+col_data$Disease.traj <- as.factor(col_data$Disease.traj)
+col_data$Pseudotime <- factor(col_data$Pseudotime)
+
+# Ensembl ID -> gene name/coordinates, so results are human-readable later
+ensg2gene <- read.table("input/gencode_v25_gene_info.txt", header = TRUE)
+unique_ensg2gene <- subset(ensg2gene, !duplicated(ensg2gene$Gene_id))
+rownames(unique_ensg2gene) <- unique_ensg2gene$Gene_id
+```
+
+> 🧪 **Exercise (sex balance)**: `table(unique(col_data[, c("PatientID", "Gender")])$Gender)` — how many male vs. female patients are there? Every sex-stratified analysis later in this tutorial (splitting the cohort in two) will have roughly half this sample size per group — worth keeping in mind when interpreting how confidently any "sex difference" result can be trusted.
+
+## 4. Selecting genes for the network
+
+Building a network on every gene is slow and mostly adds noise. We instead keep the genes with the most variable expression across samples, measured by MAD (median absolute deviation) — a version of "spread" that's more robust to outlier samples than plain variance.
+
+```{r gene-variance, fig.width=6, fig.height=4}
+vst_counts <- as.matrix(vst_counts)
+
+gene_mad <- apply(vst_counts, 1, mad)
+
+gene_var <- data.frame(Gene_id = rownames(vst_counts),
+                        mad = gene_mad,
+                        var = rowVars(vst_counts))
+gene_var <- merge(gene_var, ensg2gene, by = "Gene_id")
+
+# Rank genes by MAD, most variable first
+gene_var <- gene_var[order(gene_var$mad, decreasing = TRUE), ]
+gene_var$Seq <- seq_len(nrow(gene_var))
+
+ggplot(gene_var, aes(x = Seq, y = mad)) +
+  geom_line() +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  scale_y_log10() +
+  labs(x = "Genes (ranked by MAD)", y = "log(expression MAD)") +
+  theme_bw()
+
+# Keep the 5000 most variable genes for the network
+selected_genes <- gene_var %>%
+  arrange(desc(mad)) %>%
+  slice_head(n = 5000)
+
+vst_counts_wgcna <- vst_counts[selected_genes$Gene_id, , drop = FALSE]
+```
+
+> 🧪 **Exercise**: try `n = 2000` or `n = 10000` instead of 5000 — how does that change the number of modules you get later? More genes isn't automatically better: too many adds noise, too few can miss real structure.
+
+## 5. From counts to a WGCNA-ready matrix
+
+```{r matrix-prep}
+# WGCNA expects samples in rows, genes in columns
+wgcna_matrix <- t(vst_counts_wgcna)
+dim(wgcna_matrix)
+```
+
+## 6. Choosing a soft-thresholding power
+
+WGCNA turns raw gene-gene correlations into a weighted network by raising them to a power β. A well-chosen power suppresses weak/noisy correlations while preserving strong ones, and the result should look like a **scale-free network** — a property real biological networks tend to have.
+
+```{r soft-threshold, fig.width=8, fig.height=4}
+powers <- c(1:10, seq(12, 30, 2))
+sft <- pickSoftThreshold(wgcna_matrix, powerVector = powers, verbose = 0)
+
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft threshold (power)", ylab = "Scale free topology fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.90, col = "red", lty = 2)
+
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft threshold (power)", ylab = "Mean connectivity", type = "n",
+     main = "Mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, col = "red")
+```
+
+The rule of thumb: pick the **smallest** power where the fit curve (left) crosses ~0.80–0.90, as long as mean connectivity (right) hasn't collapsed to near-zero. Higher powers keep pushing fit up and connectivity down — past a point, that trade is no longer worth it.
+
+```{r pick-power}
+soft_power <- sft$powerEstimate
+if (is.na(soft_power)) soft_power <- 10  # fallback if pickSoftThreshold can't estimate one
+soft_power
+```
+
+`powerEstimate` already applies this rule of thumb automatically — trust it over hand-picking a power unless you have a specific reason not to.
+
+> 🧪 **Exercise**: print `sft$fitIndices[, c("Power", "SFT.R.sq", "mean.k.")]` for a couple of powers below and above `soft_power`. Would a different power meaningfully change the connectivity without much change in fit?
+
+> 🧪 **Exercise (foreshadowing Section 19)**: try re-running `pickSoftThreshold()` on just the male samples, and again on just the female samples (`wgcna_matrix[col_data[rownames(wgcna_matrix), "Gender"] == "m", ]`, and similarly for `"f"`). Does the estimated power differ between sexes? If it does, that's already a hint that the two networks may have somewhat different structure before you've even built them — Section 19 reuses one shared `soft_power` for both sexes for comparability, but it's worth knowing whether that's actually the "natural" power for each sex on its own.
+
+## 7. Building the network: adjacency and TOM
+
+```{r adjacency-tom}
+adjacency_matrix <- adjacency(wgcna_matrix, power = soft_power, type = "signed")
+
+# Topological Overlap Matrix: two genes are similar not just if they correlate
+# directly, but if they share the same neighbors — this makes the network more
+# robust to noise than using the raw adjacency alone.
+TOM <- TOMsimilarity(adjacency_matrix)
+dissTOM <- 1 - TOM
+```
+
+## 8. Detecting modules
+
+Modules are found by hierarchical clustering on the dissimilarity, then cutting the tree into branches.
+
+```{r cluster-cut, fig.width=8, fig.height=4}
+gene_tree <- hclust(as.dist(dissTOM), method = "average")
+
+module_labels <- cutreeDynamicTree(dendro = gene_tree, minModuleSize = 15, deepSplit = TRUE)
+module_colors <- labels2colors(module_labels)
+
+plotDendroAndColors(gene_tree, module_colors, "Module",
+                     dendroLabels = FALSE, hang = 0.03,
+                     addGuide = TRUE, guideHang = 0.05,
+                     main = "Gene clustering and modules")
+table(module_colors)
+length(unique(module_colors))
+```
+
+> 🧪 **Exercise**: try `minModuleSize = 30`. Do you get fewer, larger modules, or does the grey ("unassigned") module just grow? Keep this in mind for Section 19: a smaller `minModuleSize` gives more, smaller modules — and small modules are exactly the ones where a later "sex-specific" call (module preservation, gene overlap) is statistically weakest, since there's less data to test with.
+
+## 9. Checking module similarity before merging
+
+Some modules end up highly correlated with each other — candidates to merge rather than treat as biologically distinct.
+
+```{r module-similarity, fig.width=16, fig.height=8}
+# Calculate module eigengenes for the modules found before merging
+MEList <- moduleEigengenes(wgcna_matrix, colors = module_colors)
+MEs_unmerged <- MEList$eigengenes
+
+# Cluster module eigengenes based on their correlation — modules that cluster
+# together are candidates for merging
+ME_diss <- 1 - cor(MEs_unmerged)
+ME_tree <- hclust(as.dist(ME_diss), method = "average")
+
+# Module pairs joined below this height (i.e. correlation > 1 - cutHeight)
+# are the ones mergeCloseModules() will combine
+merge_cut_height <- 0.45
+
+ME_cor <- cor(MEs_unmerged)
+
+dendro_grob <- ~{
+  plot(ME_tree, main = "Clustering of module eigengenes", xlab = "", sub = "")
+  abline(h = merge_cut_height, col = "red", lty = 2)
+}
+
+heatmap_grob <- grid.grabExpr(
+  draw(Heatmap(ME_cor,
+               name = "Correlation",
+               col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+               cluster_rows = ME_tree,
+               cluster_columns = ME_tree,
+               row_names_gp = gpar(fontsize = 9),
+               column_names_gp = gpar(fontsize = 9),
+               column_title = "Module eigengene similarity (before merging)"))
+)
+
+plot_grid(dendro_grob, heatmap_grob, ncol = 2)
+```
+
+> 🧪 **Exercise**: any module pair joined below the red dashed line in the dendrogram is what `mergeCloseModules()` will combine next — find one in the heatmap too (a dark red block off the diagonal).
+
+## 10. Merging close modules
+
+```{r merge-modules}
+merged <- mergeCloseModules(wgcna_matrix, module_colors, cutHeight = 0.45, verbose = 0)
+merged_colors <- merged$colors
+
+table(merged_colors)
+```
+
+Compare this to `table(module_colors)` above — that's how many modules got merged.
+
+## 11. Naming and saving modules
+
+```{r save-modules}
+gene_module <- data.frame(
+  Gene_id     = colnames(wgcna_matrix),
+  ModuleColor = merged_colors
+)
+gene_module <- merge(gene_module, ensg2gene, by = "Gene_id")
+
+# Number modules by size (M1 = largest, excluding the "grey" catch-all module)
+module_sizes <- sort(table(gene_module$ModuleColor[gene_module$ModuleColor != "grey"]),
+                      decreasing = TRUE)
+module_number_map <- setNames(paste0("M", seq_along(module_sizes)), names(module_sizes))
+gene_module$Module <- ifelse(gene_module$ModuleColor == "grey", "unassigned",
+                              module_number_map[gene_module$ModuleColor])
+
+write.table(gene_module, file.path(folder, "gene_module.txt"),
+            quote = FALSE, sep = "\t", row.names = FALSE)
+head(gene_module)
+```
+
+The **grey** module isn't a real biological module — it's the bucket for genes that didn't fit well anywhere else. Normal to see it, but it's excluded from interpretation from here on.
+
+> 🧪 **Exercise (sex chromosome content)**: even in this one shared, both-sexes network, it's worth a quick sanity check on which modules contain X/Y genes: `table(gene_module$Module, gene_module$Chr %in% c("chrX", "chrY"))`. A module dominated by sex-chromosome genes will almost always show a strong association with sex later — not because it reflects a sex-specific *regulatory program*, but because it's trivially encoding chromosome content. Keep the modules you find here in mind as a comparison point for Section 19, where the same check is done more formally on modules built *separately* per sex.
+
+## 12. Module eigengenes
+
+The eigengene is the first principal component of a module's expression — one number per sample per module.
+
+```{r eigengenes}
+MEs0 <- moduleEigengenes(wgcna_matrix, merged_colors)$eigengenes
+MEs <- orderMEs(MEs0)
+rownames(MEs) <- rownames(wgcna_matrix)
+
+write.table(MEs, file.path(folder, "module_eigengenes.txt"), quote = FALSE, sep = "\t")
+
+MEs_named <- MEs[, colnames(MEs) != "MEgrey"]
+colnames(MEs_named) <- module_number_map[gsub("^ME", "", colnames(MEs_named))]
+head(MEs_named)
+```
+
+## 13. Module behaviour across pseudotime
+
+```{r eigengene-heatmap, fig.width=7, fig.height=5}
+pseudotime <- col_data[rownames(MEs_named), "Pseudotime"]
+
+module_by_timepoint <- sapply(split(seq_len(nrow(MEs_named)), pseudotime), function(idx) {
+  colMeans(MEs_named[idx, , drop = FALSE], na.rm = TRUE)
+})
+
+Heatmap(module_by_timepoint,
+        name = "Eigengene",
+        col = rev(brewer.pal(11, "RdYlBu")),
+        cluster_columns = FALSE,
+        column_title = "Pseudotime",
+        row_title = "Module")
+```
+
+> 🧪 **Exercise**: which module(s) rise early and fall later, versus rise late? What kind of biological process might follow each pattern?
+
+This combined view already hides a question central to this tutorial: does every module follow the *same* trajectory in both sexes, or does the timing/shape of some modules differ by sex? A quick way to check visually, before the formal interaction tests in Sections 16–18:
+
+```{r eigengene-heatmap-by-sex, fig.width=10, fig.height=5}
+sex_by_sample <- col_data[rownames(MEs_named), "Gender"]
+
+module_by_timepoint_sex <- function(sex_label) {
+  idx_sex <- which(sex_by_sample == sex_label)
+  sapply(split(idx_sex, pseudotime[idx_sex]), function(idx) {
+    colMeans(MEs_named[idx, , drop = FALSE], na.rm = TRUE)
+  })
+}
+
+ht_male <- Heatmap(module_by_timepoint_sex("m"),
+                    name = "Eigengene (M)", col = rev(brewer.pal(11, "RdYlBu")),
+                    cluster_columns = FALSE, column_title = "Male", row_title = "Module")
+ht_female <- Heatmap(module_by_timepoint_sex("f"),
+                      name = "Eigengene (F)", col = rev(brewer.pal(11, "RdYlBu")),
+                      cluster_columns = FALSE, column_title = "Female", row_title = "Module")
+
+ht_male + ht_female
+```
+
+> 🧪 **Exercise**: pick a module whose pattern (rising, falling, peaking mid-course) looks visibly different between the two panels above. Hold onto that module — Section 17's systematic interaction test will tell you whether that visual difference is actually statistically supported, or just noise from splitting an already modest sample in half.
+
+## 14. Linking modules to clinical traits
+
+```{r module-trait, fig.width=9, fig.height=6}
+clinical_data <- read.csv("input/Clinical_data_020720.csv")
+rownames(clinical_data) <- clinical_data$Name
+
+sample_name <- col_data[rownames(MEs_named), "Name"]
+common_samples <- intersect(sample_name, rownames(clinical_data))
+
+keep_samples <- sample_name %in% common_samples
+ME_by_sample <- MEs_named[keep_samples, ]
+clinical_matched <- clinical_data[sample_name[keep_samples], ]
+rownames(clinical_matched) <- rownames(ME_by_sample)
+
+# Pseudotime is carried along here too (used later, in Section 17) even
+# though it isn't part of the numeric correlation below
+clinical_matched <- cbind(clinical_matched,
+                           col_data[rownames(ME_by_sample), c("Gender", "Age", "TimepointFromOnset", "Pseudotime")])
+clinical_matched$Gender <- as.numeric(factor(clinical_matched$Gender))
+
+# Traits for this Spearman correlation heatmap — all numeric.
+# D.Dimers is excluded (too many missing values in this cohort to be reliable).
+# Pseudotime is deliberately NOT included here: it's a categorical disease
+# stage, not a continuous scale, so it doesn't belong in a correlation matrix
+# — it's modeled properly as a factor in Section 17 instead.
+trait_vars <- c("CRP", "IL6", "Ferritin", "White.blood.cells", "Lymphocytes",
+                 "Gender", "Age", "TimepointFromOnset")
+trait_vars <- intersect(trait_vars, colnames(clinical_matched))
+
+module_trait_cor <- cor(ME_by_sample, clinical_matched[, trait_vars], use = "p", method = "spearman")
+module_trait_p   <- corPvalueStudent(module_trait_cor, nrow(ME_by_sample))
+
+corrplot::corrplot(module_trait_cor, method = "color", col = viridis::viridis(30),
+                    p.mat = module_trait_p, sig.level = c(.001, .01, .05),
+                    insig = "label_sig", tl.col = "black", tl.srt = 45)
+```
+
+> 🧪 **Exercise**: which module correlates most strongly with CRP? Is it positive or negative?
+
+> 🧪 **Exercise (Gender as a trait)**: `Gender` itself is one of the columns in this heatmap — which module(s), if any, correlate significantly with it? A module correlating with sex here is a *level* difference (its average eigengene differs between males and females) — worth distinguishing from a module whose *relationship to a clinical trait* differs by sex, which is a different question the rest of this tutorial builds toward (Sections 16–18).
+
+## 15. A closer look: a mixed model for one module-trait pair, adjusted for sex
+
+Spearman correlation treats every sample as independent, but several timepoints come from the same patient. A linear mixed model (LMM) with a per-patient random intercept accounts for that — and, from here on, every model also includes `Gender` as a covariate, so any trait-module relationship is estimated *after* accounting for a possible sex-driven shift in the module's baseline level.
+
+```{r module-trait-lmm-single}
+model_data <- cbind(ME_by_sample, clinical_matched)
+model_data <- model_data[, !duplicated(colnames(model_data))]
+model_data$Gender    <- factor(model_data$Gender)
+model_data$PatientID <- factor(col_data[rownames(ME_by_sample), "PatientID"])
+
+# Example: does module M3 track with time from symptom onset, adjusting for
+# sex, and accounting for repeated timepoints per patient?
+fit <- lmer(M3 ~ TimepointFromOnset + Gender + (1 | PatientID), data = model_data)
+summary(fit)
+```
+
+> 🧪 **Exercise**: change `M3` and `TimepointFromOnset` to a different module/trait pair. Does the estimate change sign? Does it stay significant?
+
+> 🧪 **Exercise (does sex matter here?)**: refit the same model without `Gender` (`lmer(M3 ~ TimepointFromOnset + (1 | PatientID), data = model_data)`). Does the TimepointFromOnset estimate change much? A large change means sex was acting as a confounder for this particular module-trait pair — a small change means it wasn't, for this pair at least. Either way, this is still only a covariate adjustment — it tells you nothing about whether the *slope itself* differs by sex, which is exactly what Section 16 tests next.
+
+## 16. Does the relationship itself differ by sex? (the interaction test)
+
+Adjusting for `Gender` (Section 15) only lets sex shift a module's overall level. It still assumes the *slope* of the module-trait relationship — how much the module eigengene changes per unit of the trait — is the same in both sexes. That assumption is often exactly the interesting thing to question in a sex-sensitive analysis, and it's what a statistical interaction term tests directly.
+
+```{r module-trait-lmm-interaction-single}
+# Test whether the TimepointFromOnset effect on module M3 differs by sex, via
+# a likelihood ratio test comparing a model with vs. without the interaction
+H_1 <- lmer(M3 ~ Gender + TimepointFromOnset + Gender:TimepointFromOnset + (1 | PatientID),
+            data = model_data, REML = FALSE)
+H_0 <- lmer(M3 ~ Gender + TimepointFromOnset + (1 | PatientID),
+            data = model_data, REML = FALSE)
+
+anova(H_0, H_1)
+summary(H_1)
+```
+
+`anova(H_0, H_1)` tests whether allowing a different slope per sex fits meaningfully better than forcing one shared slope. `summary(H_1)`'s `Gender:TimepointFromOnset` row gives the direction and size of that difference.
+
+```{r plot-associations, fig.width=10, fig.height=5}
+p1 <- ggplot(model_data, aes(x = TimepointFromOnset, y = M3)) +
+  geom_point(alpha = 0.6, color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  labs(x = "Time from onset", y = "Module M3 eigengene",
+       title = "M3 vs. time from onset, sexes combined") +
+  theme_bw()
+
+p2 <- ggplot(model_data, aes(x = TimepointFromOnset, y = M3, color = Gender)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(x = "Time from onset", y = "Module M3 eigengene",
+       title = "M3 vs. time from onset, by sex", color = "Sex") +
+  theme_bw()
+
+p1 + p2
+```
+
+> 🧪 **Exercise**: repeat with a different module/trait pair from Section 15. Does a visually large gap between the two colored slopes always come with a significant interaction p-value?
+
+> 🧪 **Exercise (why this matters)**: if `M3`'s relationship to `TimepointFromOnset` were reported only from the sexes-combined model (`p1`, left panel) without ever checking the interaction, what conclusion would a reader walk away with — and would it describe both sexes accurately, one sex better than the other, or neither well? This is the core risk of skipping interaction testing in a mixed-sex cohort.
+
+## 17. Generalizing: screening every module x trait pair for sex-specific effects
+
+The single-pair pattern above can be looped across all modules and all traits at once. Pseudotime is added here as a **factor** (a categorical disease stage) — unlike the continuous traits, it isn't `scale()`-d, and a multi-level factor doesn't have a single "estimate," so its overall significance is read off a likelihood ratio test instead of one coefficient.
+
+```{r module-trait-lmm-interaction-loop}
+module_names <- colnames(ME_by_sample)
+
+# Same numeric traits as the correlation heatmap (minus Gender, which is
+# already a covariate in every model below)
+trait_vars_stratified <- setdiff(trait_vars, "Gender")
+
+interaction_results <- expand.grid(Module = module_names, Trait = trait_vars_stratified, stringsAsFactors = FALSE)
+interaction_results$Trait_Estimate       <- NA_real_
+interaction_results$Trait_P              <- NA_real_
+interaction_results$Interaction_Estimate <- NA_real_
+interaction_results$Interaction_P_LRT    <- NA_real_
+
+for (i in seq_len(nrow(interaction_results))) {
+  module <- interaction_results$Module[i]
+  trait  <- interaction_results$Trait[i]
+
+  formula_H1 <- as.formula(paste0(module, " ~ Gender + scale(`", trait, "`) + Gender:scale(`", trait, "`) + (1 | PatientID)"))
+  formula_H0 <- as.formula(paste0(module, " ~ Gender + scale(`", trait, "`) + (1 | PatientID)"))
+
+  H_1 <- lmer(formula_H1, data = model_data, REML = FALSE)
+  H_0 <- lmer(formula_H0, data = model_data, REML = FALSE)
+
+  # Main trait effect, taken from the no-interaction model (H_0)
+  coefs_H0  <- summary(H_0)$coefficients
+  trait_row <- grep("^scale\\(", rownames(coefs_H0), value = TRUE)[1]
+  interaction_results$Trait_Estimate[i] <- coefs_H0[trait_row, "Estimate"]
+  interaction_results$Trait_P[i]        <- coefs_H0[trait_row, "Pr(>|t|)"]
+
+  # Interaction effect, from H_1
+  coefs_H1 <- summary(H_1)$coefficients
+  interaction_row <- grep(":", rownames(coefs_H1), value = TRUE)[1]
+
+  if (is.na(interaction_row)) {
+    message("Skipping interaction for ", module, " x ", trait, ": interaction term dropped (rank-deficient model)")
+    next
+  }
+
+  lrt <- anova(H_0, H_1)
+  interaction_results$Interaction_P_LRT[i]    <- lrt$`Pr(>Chisq)`[2]
+  interaction_results$Interaction_Estimate[i] <- coefs_H1[interaction_row, "Estimate"]
+}
+
+interaction_results
+```
+
+> 🧪 **Exercise**: filter `interaction_results` to rows with `Interaction_P_LRT < 0.05` — how many module-trait pairs show a sex-specific relationship?
+
+> 🧪 **Exercise (a healthy dose of caution)**: this loop tests `length(module_names) * length(trait_vars_stratified)` hypotheses at once, with no multiple-testing correction applied. Roughly how many "significant" hits (p < 0.05) would you expect by chance alone if sex made no real difference to *any* module? Compare that to how many you actually found. This is exactly the kind of check worth doing before presenting a sex-specific finding as real.
+
+## 18. Summarizing trait and interaction effects
+
+```{r plot-all-associations, fig.width=10, fig.height=5}
+trait_est <- acast(interaction_results, Module ~ Trait, value.var = "Trait_Estimate")
+trait_p   <- acast(interaction_results, Module ~ Trait, value.var = "Trait_P")
+
+interaction_est <- acast(interaction_results, Module ~ Trait, value.var = "Interaction_Estimate")
+interaction_p   <- acast(interaction_results, Module ~ Trait, value.var = "Interaction_P_LRT")
+
+redblue <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(200)
+
+par(mfrow = c(1, 2))
+
+corrplot::corrplot(trait_est, method = "color", col = redblue,
+                    p.mat = trait_p, sig.level = c(.001, .01, .05),
+                    insig = "label_sig", pch.cex = 0.8,
+                    tl.col = "black", tl.srt = 45,
+                    is.corr = FALSE,
+                    title = "Trait effect on module eigengenes",
+                    mar = c(0, 0, 2, 0))
+
+corrplot::corrplot(interaction_est, method = "color", col = redblue,
+                    p.mat = interaction_p, sig.level = c(.001, .01, .05),
+                    insig = "label_sig", pch.cex = 0.8,
+                    tl.col = "black", tl.srt = 45,
+                    is.corr = FALSE,
+                    title = "Sex x trait interaction effect on module eigengenes",
+                    mar = c(0, 0, 2, 0))
+```
+
+> 🧪 **Exercise**: find a module-trait pair that's significant in the left panel but not the right (a shared effect, not sex-specific) and one that's the other way around (sex-specific, but no strong overall effect). What would each mean biologically?
+
+## 19. Optional advanced extension: comparing networks between sexes
+
+Everything above treats sex as a covariate inside one shared network. A different question: do males and females even have the *same network structure* to begin with? Two ways to check, in increasing order of rigor and runtime:
+
+- **Quick, qualitative check**: build separate networks per sex, then see whether male-defined and female-defined modules contain the same genes (a gene-overlap test). Fast — runs live.
+- **Formal module preservation** (`WGCNA::modulePreservation()`): the statistically rigorous way to test this, using permutation testing. Slow (minutes, even at a reduced permutation count) — the rest of this section (from 19.2 onward) is marked `eval=FALSE` and meant to be run afterward, not live.
+
+### 19.1 Building sex-specific networks and checking overlap
+
+```{r sex-specific-networks}
+male_samples   <- rownames(wgcna_matrix)[col_data[rownames(wgcna_matrix), "PatientID"] %in%
+                                            unique(col_data$PatientID[col_data$Gender == "m"])]
+female_samples <- rownames(wgcna_matrix)[col_data[rownames(wgcna_matrix), "PatientID"] %in%
+                                            unique(col_data$PatientID[col_data$Gender == "f"])]
+
+wgcna_matrix_male   <- wgcna_matrix[male_samples, ]
+wgcna_matrix_female <- wgcna_matrix[female_samples, ]
+
+# Check for genes/samples that are unusable across both sex-specific sets
+# (zero variance or excessive missingness in at least one set) before
+# building networks, so both sets share the same gene set from the start
+multi_expr <- list(Male = list(data = wgcna_matrix_male), Female = list(data = wgcna_matrix_female))
+gsg <- goodSamplesGenesMS(multi_expr, verbose = 3)
+
+if (!gsg$allOK) {
+  wgcna_matrix_male   <- wgcna_matrix_male[gsg$goodSamples[[1]], gsg$goodGenes]
+  wgcna_matrix_female <- wgcna_matrix_female[gsg$goodSamples[[2]], gsg$goodGenes]
+}
+
+build_modules <- function(expr_matrix, power) {
+  adjacency_matrix <- adjacency(expr_matrix, power = power, type = "signed")
+  TOM <- TOMsimilarity(adjacency_matrix)
+  dissTOM <- 1 - TOM
+  gene_tree <- hclust(as.dist(dissTOM), method = "average")
+  module_labels <- cutreeDynamicTree(dendro = gene_tree, minModuleSize = 15, deepSplit = TRUE)
+  labels2colors(module_labels)
+}
+
+modules_male   <- build_modules(wgcna_matrix_male, soft_power)
+modules_female <- build_modules(wgcna_matrix_female, soft_power)
+
+multi_color <- list(Male = modules_male, Female = modules_female)
+
+table(modules_male)
+table(modules_female)
+```
+
+```{r sex-specific-overlap, fig.width=20, fig.height=16}
+# How much do male-defined and female-defined modules overlap, gene for gene?
+overlap_table <- table(Male = modules_male, Female = modules_female)
+
+# Fisher's exact test p-value for each male-module x female-module pair
+overlap_p <- matrix(NA_real_, nrow = nrow(overlap_table), ncol = ncol(overlap_table),
+                     dimnames = dimnames(overlap_table))
+total_genes <- length(modules_male)
+
+for (i in rownames(overlap_table)) {
+  for (j in colnames(overlap_table)) {
+    a <- overlap_table[i, j]
+    b <- sum(modules_male == i) - a
+    c <- sum(modules_female == j) - a
+    d <- total_genes - a - b - c
+    overlap_p[i, j] <- fisher.test(matrix(c(a, b, c, d), nrow = 2))$p.value
+  }
+}
+
+sig_stars <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) "***"
+  else if (p < 0.01) "**"
+  else if (p < 0.05) "*"
+  else ""
+}
+
+Heatmap(overlap_table,
+        name = "Gene\noverlap",
+        col = colorRamp2(c(0, max(overlap_table)), c("white", "red")),
+        cluster_rows = TRUE, cluster_columns = TRUE,
+        row_title = "Male modules", column_title = "Female modules",
+        rect_gp = gpar(col = "grey50", lwd = 1),
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          count <- overlap_table[i, j]
+          stars <- sig_stars(overlap_p[i, j])
+          grid.text(count, x, y - unit(2, "mm"), gp = gpar(fontsize = 8))
+          grid.text(stars, x, y + unit(2, "mm"), gp = gpar(fontsize = 8, col = "black"))
+        })
+```
+
+```{r sex-specific-modules-overlap}
+# A module is "sex-specific" if it doesn't show significant gene overlap
+# with any module in the other sex's network (excluding "grey")
+male_modules_named   <- setdiff(rownames(overlap_table), "grey")
+female_modules_named <- setdiff(colnames(overlap_table), "grey")
+
+overlap_p_named <- overlap_p[male_modules_named, female_modules_named, drop = FALSE]
+
+male_specific   <- male_modules_named[apply(overlap_p_named, 1, function(p) all(p >= 0.05, na.rm = TRUE))]
+female_specific <- female_modules_named[apply(overlap_p_named, 2, function(p) all(p >= 0.05, na.rm = TRUE))]
+
+male_specific
+female_specific
+```
+
+> 🧪 **Exercise**: finding no sex-specific modules here is a real, useful result too — it means network *membership* looks similar between sexes, even if (as Section 18 showed) a shared module's *relationship to a trait* can still differ by sex.
+
+### 19.2 Formal module preservation (slow)
+
+```{r module-preservation, eval=FALSE}
+# ------------------------------------------------------------------
+# modulePreservation() formally tests whether modules found in one sex
+# ("reference") are reproducible in the other ("test"), using a
+# permutation-based Z-summary statistic (Langfelder et al. 2011).
+# Z-summary > 10 = strong preservation, 2-10 = weak/moderate, < 2 = not
+# preserved. Much more rigorous than the overlap heatmap above, but
+# permutation testing is slow — expect several minutes even here.
+# ------------------------------------------------------------------
+
+multi_expr <- list(Male = list(data = wgcna_matrix_male), Female = list(data = wgcna_matrix_female))
+
+preservation <- modulePreservation(
+  multiData = multi_expr,
+  multiColor = multi_color,
+  referenceNetworks = 1:2,      # test each sex as the reference in turn
+  nPermutations = 50,           # reduced from the default 200 for speed
+  randomSeed = 1,
+  verbose = 1
+)
+
+male_ref_summary   <- preservation$preservation$Z$ref.Male$inColumnsAlsoPresentIn.Female
+female_ref_summary <- preservation$preservation$Z$ref.Female$inColumnsAlsoPresentIn.Male
+
+male_ref_summary[order(-male_ref_summary$Zsummary.pres), c("moduleSize", "Zsummary.pres")]
+female_ref_summary[order(-female_ref_summary$Zsummary.pres), c("moduleSize", "Zsummary.pres")]
+```
+
+```{r sex-specific-modules-preservation, eval=FALSE}
+# Zsummary.pres < 2 = not preserved -> treated as sex-specific here.
+# "gold" is WGCNA's internal random-gene reference module, not a real one —
+# excluded along with "grey" (unassigned genes).
+exclude_modules <- c("grey", "gold")
+
+male_specific_preservation <- rownames(male_ref_summary)[
+  !(rownames(male_ref_summary) %in% exclude_modules) & male_ref_summary$Zsummary.pres < 2
+]
+
+female_specific_preservation <- rownames(female_ref_summary)[
+  !(rownames(female_ref_summary) %in% exclude_modules) & female_ref_summary$Zsummary.pres < 2
+]
+
+male_specific_preservation
+female_specific_preservation
+```
+
+`Zsummary.pres` is sensitive to module size — small modules score lower even when genuinely preserved, since the permutation test has less power with fewer genes. Treat a small module more cautiously than a large one.
+
+```{r sex-specific-modules-preservation-genes, eval=FALSE}
+male_specific_genes_pres <- lapply(male_specific_preservation, function(mod) {
+  genes <- colnames(wgcna_matrix_male)[modules_male == mod]
+  unique_ensg2gene[genes, ]
+})
+names(male_specific_genes_pres) <- male_specific_preservation
+
+female_specific_genes_pres <- lapply(female_specific_preservation, function(mod) {
+  genes <- colnames(wgcna_matrix_female)[modules_female == mod]
+  unique_ensg2gene[genes, ]
+})
+names(female_specific_genes_pres) <- female_specific_preservation
+
+male_specific_genes_pres
+female_specific_genes_pres
+```
+
+```{r module-size-table, eval=FALSE}
+male_size_table <- data.frame(
+  Sex = "Male",
+  Module = names(male_specific_genes_pres),
+  n_genes = sapply(male_specific_genes_pres, nrow)
+)
+
+female_size_table <- data.frame(
+  Sex = "Female",
+  Module = names(female_specific_genes_pres),
+  n_genes = sapply(female_specific_genes_pres, nrow)
+)
+
+module_size_table <- rbind(male_size_table, female_size_table)
+module_size_table
+```
+
+Modules noticeably smaller than the rest are the ones to treat with the most caution (see the note above on `Zsummary.pres` and size).
+
+```{r sex-chromosome-check, eval=FALSE}
+# Before reading anything biological into a "sex-specific" module, rule out
+# the boring explanation: is it just sitting on a sex chromosome?
+summarize_sex_chromosomes <- function(gene_df_list) {
+  do.call(rbind, lapply(names(gene_df_list), function(mod) {
+    chr <- gene_df_list[[mod]]$Chr
+    data.frame(
+      Module        = mod,
+      n_genes       = length(chr),
+      n_X           = sum(chr == "chrX", na.rm = TRUE),
+      n_Y           = sum(chr == "chrY", na.rm = TRUE),
+      pct_sex_chrom = round(100 * sum(chr %in% c("chrX", "chrY"), na.rm = TRUE) / length(chr), 1)
+    )
+  }))
+}
+
+male_chrom_summary   <- summarize_sex_chromosomes(male_specific_genes_pres)
+male_chrom_summary$Sex <- "Male"
+
+female_chrom_summary <- summarize_sex_chromosomes(female_specific_genes_pres)
+female_chrom_summary$Sex <- "Female"
+
+chrom_summary <- rbind(male_chrom_summary, female_chrom_summary)
+chrom_summary[, c("Sex", "Module", "n_genes", "n_X", "n_Y", "pct_sex_chrom")]
+```
+
+A high `pct_sex_chrom` means the module is "sex-specific" mainly because of its X/Y content — a much less interesting story than a sex-specific *autosomal* program, which is what to prioritize below.
+
+> If, when you run this, a Y-chromosome gene shows up in a module you called "female," check whether it's uniformly low across all female samples (likely a network-construction artifact/cross-mapping noise) or clearly elevated in a specific sample (worth cross-checking that sample's sex label before trusting any downstream result from it).
+
+### 19.3 A worked example: following up on one module
+
+The rest of this section walks through one module in depth — substitute whichever module (and sex) your own run flags as the most interesting, largest, and most clearly autosomal.
+
+```{r module-eigengene-by-sex, eval=FALSE}
+# Replace "black" / wgcna_matrix_female / modules_female below with whichever
+# module and sex your own preservation results point to
+module_of_interest <- "black"
+module_genes <- colnames(wgcna_matrix_female)[modules_female == module_of_interest]
+
+# Eigengene computed once, on the combined matrix, so both sexes are on the
+# same scale for direct comparison
+module_eigengene <- moduleEigengenes(wgcna_matrix[, module_genes],
+                                      colors = rep(module_of_interest, length(module_genes)))$eigengenes
+
+module_df <- data.frame(
+  Sample = rownames(wgcna_matrix),
+  ME = module_eigengene[[paste0("ME", module_of_interest)]],
+  Gender = col_data[rownames(wgcna_matrix), "Gender"]
+)
+
+ggplot(module_df, aes(x = Gender, y = ME, fill = Gender)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(y = paste(module_of_interest, "module eigengene"), title = "Module eigengene, by sex") +
+  theme_bw()
+```
+
+This eigengene-by-sex plot alone won't necessarily show a mean-level difference — sex-specificity here is about *network structure*, not eigengene magnitude. The next chunk checks that more directly.
+
+```{r module-connectivity-comparison, eval=FALSE}
+adj_female <- adjacency(wgcna_matrix_female[, module_genes], power = soft_power, type = "signed")
+adj_male   <- adjacency(wgcna_matrix_male[, module_genes], power = soft_power, type = "signed")
+
+conn_female <- rowSums(adj_female) - 1  # subtract self-connection
+conn_male   <- rowSums(adj_male) - 1
+
+conn_compare <- data.frame(Gene = module_genes, Female = conn_female, Male = conn_male)
+
+ggplot(conn_compare, aes(x = Male, y = Female)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = paste(module_of_interest, "module: gene connectivity, female vs. male network"),
+       x = "Connectivity in male network", y = "Connectivity in female network") +
+  theme_bw()
+```
+
+Genes far above the diagonal (highly connected in one sex's network, not the other) are the ones actually driving the "not preserved" call — this is the plot that most directly matches what `modulePreservation()` tested.
+
+```{r module-clinical-relevance, eval=FALSE}
+module_df$Name <- col_data[rownames(wgcna_matrix), "Name"]
+module_df_female <- module_df[module_df$Gender == "f", ]
+
+module_clinical <- clinical_matched[module_df_female$Sample, trait_vars_stratified]
+module_clinical$ME <- module_df_female$ME
+module_clinical$PatientID <- col_data[rownames(wgcna_matrix)[match(module_df_female$Name, col_data$Name)], "PatientID"]
+
+# Continuous traits get a shared scatter grid; Pseudotime (categorical) gets
+# its own boxplot rather than sharing an x-axis with numeric traits
+continuous_traits <- setdiff(trait_vars_stratified, "Pseudotime")
+module_clinical_long <- melt(module_clinical[, c("ME", "PatientID", continuous_traits)],
+                              id.vars = c("ME", "PatientID"),
+                              variable.name = "Trait", value.name = "Value")
+
+ggplot(module_clinical_long, aes(x = Value, y = ME)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  facet_wrap(~ Trait, scales = "free_x") +
+  labs(y = paste(module_of_interest, "module eigengene"), x = NULL,
+       title = "Module eigengene vs. clinical traits (females only)") +
+  theme_bw()
+
+```
+
+```{r module-lmm-clinical, eval=FALSE}
+module_lmm_results <- data.frame(Trait = trait_vars_stratified,
+                                  Estimate = NA_real_, P.value = NA_real_)
+
+for (i in seq_along(trait_vars_stratified)) {
+  trait <- trait_vars_stratified[i]
+  trait_term <- if (trait == "Pseudotime") "Pseudotime" else paste0("scale(`", trait, "`)")
+  formula_i <- as.formula(paste0("ME ~ ", trait_term, " + (1 | PatientID)"))
+  fit <- lmer(formula_i, data = module_clinical)
+
+  if (trait == "Pseudotime") {
+    fit_null <- lmer(ME ~ 1 + (1 | PatientID), data = module_clinical)
+    module_lmm_results$P.value[i] <- anova(fit_null, fit)$`Pr(>Chisq)`[2]
+    # Estimate stays NA — no single coefficient for a multi-level factor
+  } else {
+    coefs <- summary(fit)$coefficients
+    trait_row <- grep("^scale\\(", rownames(coefs), value = TRUE)[1]
+    module_lmm_results$Estimate[i] <- coefs[trait_row, "Estimate"]
+    module_lmm_results$P.value[i]  <- coefs[trait_row, "Pr(>|t|)"]
+  }
+}
+
+module_lmm_results[order(module_lmm_results$P.value), ]
+```
+
+```{r module-trajectory-plot, eval=FALSE}
+ggplot(module_clinical, aes(x = TimepointFromOnset, y = ME, color = CRP)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c() +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dashed") +
+  labs(y = paste(module_of_interest, "module eigengene"), x = "Time from onset",
+       title = "Module trajectory (females), colored by CRP") +
+  theme_bw()
+```
+
+If this module shows a real, significant relationship to a clinical trait *within one sex* — a relationship you couldn't even test the same way in the other sex, since the network structure doesn't reproduce there — that ties together the whole thread: soft-thresholding → modules → preservation → connectivity confirmation → clinical relevance. One honest caveat: this is one module tested against several traits in a fairly small subset of patients, and without correction for multiple testing — treat a hit here as a hypothesis worth validating in a larger cohort, not a confirmed finding.
+
+### 19.4 Functional enrichment of the module
+
+```{r module-go-enrichment, eval=FALSE}
+library(topGO)
+library(org.Hs.eg.db)
+
+# Universe = every gene that went into the network — the appropriate
+# background for "what's over-represented in this module relative to the
+# genes we actually tested," not the whole genome
+gene_universe <- colnames(wgcna_matrix)
+
+geneList <- factor(as.integer(gene_universe %in% module_genes))
+names(geneList) <- gene_universe
+
+GOdata <- new("topGOdata",
+              ontology = "BP",
+              allGenes = geneList,
+              geneSel = function(x) x == 1,
+              annot = annFUN.org,
+              mapping = "org.Hs.eg.db",
+              ID = "ensembl",
+              nodeSize = 5)  # ignore GO terms with fewer than 5 annotated genes
+
+result_fisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+
+go_results <- GenTable(GOdata, classicFisher = result_fisher,
+                        orderBy = "classicFisher", topNodes = 20)
+go_results$classicFisher <- as.numeric(gsub("< ", "", go_results$classicFisher))
+
+go_results
+```
+
+```{r module-go-enrichment-plot, eval=FALSE}
+go_results$Term <- factor(go_results$Term, levels = rev(go_results$Term))
+
+ggplot(go_results[1:15, ], aes(x = Term, y = -log10(classicFisher))) +
+  geom_col(fill = "black") +
+  coord_flip() +
+  labs(x = NULL, y = "-log10(p-value)",
+       title = paste("Top enriched GO terms —", module_of_interest, "module")) +
+  theme_bw()
+```
