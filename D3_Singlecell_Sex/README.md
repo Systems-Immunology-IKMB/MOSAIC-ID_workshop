@@ -12,7 +12,7 @@
 D3_Singlecell_Sex/
 ├── sample_sheet.csv
 ├── input/                       # not in git (patient data)
-│   ├── <folder of sample 1>/filtered_feature_bc_matrix/   (or raw_feature_bc_matrix/)
+│   ├── <folder of sample 1>/raw_feature_bc_matrix/   (matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz)
 │   └── ...
 └── output/                      # created by the notebooks
 ```

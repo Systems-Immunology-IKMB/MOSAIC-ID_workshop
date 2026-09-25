@@ -157,26 +157,27 @@ Cell Ranger writes two matrices per sample:
 - `raw_feature_bc_matrix`: **all** barcodes, including empty droplets
 - `filtered_feature_bc_matrix`: only barcodes that Cell Ranger called as cells
 
-We use the filtered matrix when it is there. Otherwise we use the raw matrix and
-rely on `min.features = 200` to drop most empty droplets. That is a crude
-filter; `DropletUtils::emptyDrops()` is the proper tool.
+In this course we start from the **raw** matrix of every sample. Most of its
+barcodes are empty droplets that contain only ambient RNA. `min.features = 200`
+in `CreateSeuratObject()` removes barcodes with fewer than 200 detected genes,
+which drops most of them. That is a crude filter; `DropletUtils::emptyDrops()`
+is the proper tool.
 
 ```{r read10x}
 read_sample <- function(folder) {
-  base <- file.path(params$input_dir, folder)
-  mdir <- c(file.path(base, "filtered_feature_bc_matrix"),
-            file.path(base, "raw_feature_bc_matrix"),
-            base)
-  mdir <- mdir[file.exists(mdir)][1]
-  if (is.na(mdir)) stop("No count matrix found for ", folder)
+  mdir <- file.path(params$input_dir, folder, "raw_feature_bc_matrix")
+  if (!dir.exists(mdir)) stop("No raw_feature_bc_matrix folder found for ", folder, " (looked in ", mdir, ")")
   message("Reading ", mdir)
   counts <- Read10X(data.dir = mdir)
   if (is.list(counts)) counts <- counts[["Gene Expression"]]  # CITE-seq / multiome output
   counts
 }
+n_raw_barcodes <- c()
 
 seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
-  obj <- CreateSeuratObject(counts = read_sample(samples$folder[i]),
+  counts <- read_sample(samples$folder[i])
+  n_raw_barcodes[samples$sample_id[i]] <<- ncol(counts)
+  obj <- CreateSeuratObject(counts = counts,
                             project = samples$sample_id[i],
                             min.cells = 3, min.features = 200)
   # add the sample-level metadata to every cell
@@ -185,8 +186,13 @@ seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
 })
 names(seurat_list) <- samples$sample_id
 
-sapply(seurat_list, ncol)  # cells per sample
+data.frame(raw_barcodes = n_raw_barcodes[names(seurat_list)],
+           after_min_features = sapply(seurat_list, ncol))  # barcodes kept per sample
 ```
+
+> **Question.** How many barcodes does the raw matrix of each sample contain,
+> and how many are left after `min.features = 200`? Compare with the number of cells Cell Ranger reports
+> in each sample's `web_summary.html`.
 
 > **Exercise 1.1.** Pick one object, e.g. `seurat_list$HC_M`.
 > What does `dim()` return? Which number is cells and which is genes?
