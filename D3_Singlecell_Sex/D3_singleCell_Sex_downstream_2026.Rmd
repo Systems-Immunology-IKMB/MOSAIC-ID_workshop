@@ -124,25 +124,41 @@ repeated_donors <- any(duplicated(sample_info$donor))
 repeated_donors
 ```
 
+**Our design:** 4 donors, one per sex × disease group. Each COVID-19 donor
+was sampled at two time points (T1, T2), so we have 6 samples.
+
+| | female | male |
+|---|---|---|
+| COVID-19 | donor COV_F: T1, T2 | donor COV_M: T1, T2 |
+| healthy | donor HC_F | donor HC_M |
+
 > **Exercise 1 (5 min, pen & paper).**
 >
 > 1. How many biological replicates (donors) are there per sex × disease
 >    group?
 > 2. A linear model with `~ sex + disease` estimates 3 parameters
->    (intercept, sex, disease). With 6 samples, how many residual degrees of
->    freedom are left to estimate the variability? And with
->    `~ sex * disease` (4 parameters)?
-> 3. If both COVID-19 samples of one sex come from the **same person** (two
->    time points), what is the variability between them actually measuring?
+>    (intercept, sex, disease). If we treat the 6 samples as independent,
+>    how many residual degrees of freedom are left? And if we count
+>    donors (4) instead of samples?
+> 3. The two COVID-19 samples of a sex come from the **same person**. What
+>    is the variability between them actually measuring?
+> 4. The "sex difference in healthy people" is estimated from how many
+>    women and how many men? And the sex × disease interaction?
 
 ```{asis, echo=params$solutions}
-**Solution.** (2) 6 - 3 = 3 and 6 - 4 = 2 residual degrees of freedom.
-With so few, the variance estimates are very uncertain. limma/DESeq2 borrow
-information across genes or cell types, which helps, but power stays low.
-(3) Two samples from one donor measure *within-person* (time-point and
-technical) variability, not *between-person* variability. Treating them as
-independent donors makes the groups look less variable than they are, and
-the p-values come out too small. We come back to this in 2.4 and 3.6.
+**Solution.** (1) One donor per group. (2) With samples: 6 - 3 = 3 residual
+df (6 - 4 = 2 for `~ sex * disease`). With donors: 4 - 3 = 1, and 0 for the
+interaction model, so nothing is left to estimate the between-person
+variability. (3) T1 vs T2 of one patient measures *within-person* variability
+(disease course and technical noise), not *between-person* variability. When
+we treat the time points as replicates, the COVID-19 groups look less variable
+than people really are, so p-values are too small. The healthy groups have no
+replicate at all. (4) One woman vs one man. The interaction compares
+(COV_F − HC_F) with (COV_M − HC_M), i.e. four individuals, so any individual
+difference (age, genetics, severity, day of sampling) is inseparable from
+"sex". **Everything we compute today is a demonstration of the methods, not
+evidence of sex differences in COVID-19.** We come back to this in 2.4, 3.6
+and 5.
 ```
 
 # 2. Differential abundance: cell proportions
@@ -280,10 +296,13 @@ topTable(fit_int, coef = "sexmale:diseaseCOVID19", sort.by = "P")
 # residual df = 6 samples - 4 coefficients = 2 -> very little power: absence of evidence != evidence of absence
 ```
 
-> **Exercise 2.5 (repeated donors).** If some donors contributed two
-> samples, they are not independent. limma can model this with
-> `duplicateCorrelation()` and a `block` (the donor). Try it on
-> `props$TransformedProps`. What happens to the p-values?
+> **Exercise 2.5 (repeated donors).** Our COVID-19 donors contributed two
+> samples each, and these are not independent. Two ways to handle this:
+>
+> 1. limma's `duplicateCorrelation()` with `block = donor`. Try it on
+>    `props$TransformedProps`. What happens to the p-values?
+> 2. Average the two time points per donor and re-run propeller on the 4
+>    donors. How many residual degrees of freedom are left?
 
 ```{r ex2.5-solution, eval=params$solutions && repeated_donors, include=params$solutions && repeated_donors}
 design_add <- model.matrix(~ sex + disease, data = si)
@@ -293,7 +312,18 @@ fit <- lmFit(props$TransformedProps, design_add, block = si$donor, correlation =
 fit <- eBayes(fit, robust = TRUE)
 topTable(fit, coef = "diseaseCOVID19", sort.by = "P")
 topTable(fit, coef = "sexmale",        sort.by = "P")
-# With only 4 donors this correlation is itself very uncertain - another reason to sample more individuals.
+# The correlation is estimated from only 2 donors with repeated samples, so it is itself very uncertain.
+
+# (2) donor level: sum the cells of both time points per donor
+props_donor <- getTransformedProps(clusters = obj$CellTypes, sample = obj$donor, transform = "logit")
+si_donor <- distinct(sample_info, donor, sex, disease)
+rownames(si_donor) <- si_donor$donor
+si_donor <- si_donor[colnames(props_donor$TransformedProps), ]
+design_donor <- model.matrix(~ 0 + disease + sex, data = si_donor)
+nrow(design_donor) - ncol(design_donor)     # residual df = 1
+propeller.ttest(props_donor, design = design_donor, contrasts = c(-1, 1, 0),
+                robust = TRUE, trend = FALSE, sort = TRUE)
+# With 1 residual df the p-values rest almost entirely on the prior borrowed across cell types.
 ```
 
 Other DA methods you may meet: `sccomp` (Bayesian compositional model),
@@ -311,6 +341,10 @@ for pseudobulk). Rule, from strict to lenient:
 3. otherwise the cell type with the smallest max(p_disease, p_sex)
 
 Instructors can override the choice with `params$celltype_of_interest`.
+
+**Caveat for our data:** these p-values treat the two time points of each
+COVID-19 donor as independent replicates, so they are optimistic (see
+Exercise 2.5). We use them only to *pick an example*, not to make claims.
 
 ```{r choose-celltype}
 candidates <- da %>% filter(min_cells >= params$min_cells)
@@ -655,6 +689,29 @@ summary(decideTests(fit2))
 # Compare with DESeq2. (variancePartition::dream from Day 2 fits the donor as a proper random effect.)
 ```
 
+> **Exercise 3.7 (donor-level pseudobulk).** Sum the pseudobulk counts of the
+> two time points per donor (`pseudobulk(sub, "donor")`), so there is one
+> profile per person. Fit `~ sex + disease` with DESeq2. How many DE genes
+> do you get now? Then try `~ 0 + group`. What happens, and why?
+
+```{r ex3.7-solution, eval=params$solutions && repeated_donors, include=params$solutions && repeated_donors}
+pb_donor <- pseudobulk(sub, "donor")
+cd_donor <- distinct(sample_info, donor, sex, disease, group)
+rownames(cd_donor) <- cd_donor$donor
+cd_donor <- cd_donor[colnames(pb_donor), ]
+pb_donor <- pb_donor[filterByExpr(pb_donor, group = cd_donor$group), ]
+
+dds_donor <- DESeq(DESeqDataSetFromMatrix(pb_donor, cd_donor, design = ~ sex + disease), quiet = TRUE)
+c(disease = n_sig(tidy_res(results(dds_donor, name = "disease_COVID19_vs_healthy"))),
+  sex     = n_sig(tidy_res(results(dds_donor, name = "sex_male_vs_female"))))
+
+# one mean per group with one donor per group: 0 residual df, dispersion cannot be estimated
+tryCatch(DESeq(DESeqDataSetFromMatrix(pb_donor, cd_donor, design = ~ 0 + group), quiet = TRUE),
+         error = function(e) cat("Error:", conditionMessage(e), "\n"))
+# The honest answer to "is the COVID-19 response different in women and men?" with these data is:
+# we cannot test it. The sample-level results in 3.6 borrow their replication from the time points.
+```
+
 # 4. Enrichment analysis
 
 Next we ask which biological processes are behind the DE genes, **separately
@@ -814,6 +871,10 @@ data.frame(
 > Based on today's analysis, write two sentences you could put in the
 > *Results* section of a paper about `r coi` in COVID-19, and one sentence
 > for the *Limitations*.
+>
+> How many donors per group would you need for a real study? Look at the
+> variability between the two healthy donors and between the time points of
+> each patient, and discuss.
 
 ## Further reading
 

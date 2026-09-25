@@ -22,6 +22,8 @@ D3_Singlecell_Sex/
 - `sample_id`: short name used in all plots
 - `folder`: the sub-folder in `input/`
 - `donor`: the **person**. Two samples from the same person must have the same donor ID; Part 2 then adds the donor-blocking exercises automatically.
+
+  Our design: 4 donors, one per sex × disease group. Each COVID-19 donor (one female, one male) was sampled at two time points (T1, T2). Healthy controls have one sample each. Donor IDs and time points are pre-filled; only the folder names are missing.
 - `disease`: `healthy` / `COVID19`
 - `sex`: `female` / `male`
 - `timepoint`

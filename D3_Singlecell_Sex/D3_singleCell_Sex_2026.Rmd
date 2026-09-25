@@ -79,14 +79,27 @@ PBMCs (peripheral blood mononuclear cells) from Bernardes *et al.* (2020,
 
 | | female | male |
 |---|---|---|
-| COVID-19 | 2 samples | 2 samples |
-| healthy | 1 sample | 1 sample |
+| COVID-19 | 1 donor, 2 time points (2 samples) | 1 donor, 2 time points (2 samples) |
+| healthy | 1 donor (1 sample) | 1 donor (1 sample) |
+
+That is 6 samples, but only **4 people**: one per sex × disease group.
 
 > **Exercise 0 (discussion, 5 min).** Look at `sample_sheet.csv`.
 > How many *samples* do we have per group? How many *individuals (donors)*?
 > Which of the two counts is our number of biological replicates? Write down
 > what you expect you *can* and *cannot* conclude about sex differences with
 > this design. We will come back to your answer in Part 2.
+
+```{asis, echo=params$solutions}
+**Discussion notes (instructor).** 6 samples, 4 donors, 1 donor per group:
+the biological replicate is the donor, so n = 1 per group. The two time
+points of a COVID-19 patient are *repeated measures* of the same person.
+Every comparison between groups is also a comparison between individuals:
+"female vs male" in the healthy group is one woman vs one man. We can
+**learn and practise** sex-sensitive methods on these data, but we cannot
+generalise sex differences to a population. That needs several donors per
+group (see Part 2).
+```
 
 In this tutorial we use the R package **Seurat** (v5). Popular alternatives
 include scanpy (Python), scran/scater (Bioconductor) and the book

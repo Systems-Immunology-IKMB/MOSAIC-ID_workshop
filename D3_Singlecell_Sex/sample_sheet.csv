@@ -1,7 +1,7 @@
 sample_id,folder,donor,disease,sex,timepoint,notes
-COV_F_1,FILL_ME,FILL_ME,COVID19,female,FILL_ME,COVID-19 female sample 1
-COV_F_2,FILL_ME,FILL_ME,COVID19,female,FILL_ME,COVID-19 female sample 2 (same donor as COV_F_1? then use the same donor ID)
-COV_M_1,FILL_ME,FILL_ME,COVID19,male,FILL_ME,COVID-19 male sample 1
-COV_M_2,FILL_ME,FILL_ME,COVID19,male,FILL_ME,COVID-19 male sample 2 (same donor as COV_M_1? then use the same donor ID)
-HC_F,FILL_ME,FILL_ME,healthy,female,baseline,healthy control female
+COV_F_T1,FILL_ME,COV_F,COVID19,female,T1,COVID-19 female donor - first time point
+COV_F_T2,FILL_ME,COV_F,COVID19,female,T2,COVID-19 female donor - second time point (same person as COV_F_T1)
+COV_M_T1,FILL_ME,COV_M,COVID19,male,T1,COVID-19 male donor - first time point
+COV_M_T2,FILL_ME,COV_M,COVID19,male,T2,COVID-19 male donor - second time point (same person as COV_M_T1)
+HC_F,FILL_ME,HC_F,healthy,female,baseline,healthy control female
 HC_M,J15438_H013_control,H013,healthy,male,baseline,healthy control male (H013 in the 2022 version - please check)
