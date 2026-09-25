@@ -165,7 +165,10 @@ is the proper tool.
 
 ```{r read10x}
 read_sample <- function(folder) {
-  mdir <- file.path(params$input_dir, folder, "raw_feature_bc_matrix")
+  # `folder` can be a sub-folder of params$input_dir or a full path to the sample folder
+  folder <- sub("/+$", "", path.expand(folder))
+  base <- if (dir.exists(folder)) folder else file.path(params$input_dir, folder)
+  mdir <- if (basename(base) == "raw_feature_bc_matrix") base else file.path(base, "raw_feature_bc_matrix")
   if (!dir.exists(mdir)) stop("No raw_feature_bc_matrix folder found for ", folder, " (looked in ", mdir, ")")
   message("Reading ", mdir)
   counts <- Read10X(data.dir = mdir)
