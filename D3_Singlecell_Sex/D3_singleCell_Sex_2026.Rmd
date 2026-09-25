@@ -136,9 +136,15 @@ metadata by hand for each object. This is less work and avoids copy-paste
 errors, such as assigning the wrong sex to a sample.
 
 ```{r sample-sheet}
-samples <- read.csv(params$sample_sheet, stringsAsFactors = FALSE)
+# fileEncoding handles CSVs saved from Excel; strip.white removes stray spaces
+samples <- read.csv(params$sample_sheet, stringsAsFactors = FALSE,
+                    fileEncoding = "UTF-8-BOM", strip.white = TRUE)
 samples
 
+required <- c("sample_id", "folder", "donor", "disease", "sex", "timepoint")
+missing_cols <- setdiff(required, colnames(samples))
+if (length(missing_cols) > 0) stop("Sample sheet is missing column(s): ", paste(missing_cols, collapse = ", "),
+                                   ". Found: ", paste(colnames(samples), collapse = ", "))
 stopifnot(
   "Please fill in the FILL_ME fields of the sample sheet" = !any(samples == "FILL_ME", na.rm = TRUE),
   "sex must be 'female' or 'male'"         = all(samples$sex %in% c("female", "male")),
@@ -188,6 +194,7 @@ seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
   obj
 })
 names(seurat_list) <- samples$sample_id
+names(seurat_list)   # the objects are now called by their sample_id, e.g. seurat_list$HC_M
 
 data.frame(raw_barcodes = n_raw_barcodes[names(seurat_list)],
            after_min_features = sapply(seurat_list, ncol))  # barcodes kept per sample
