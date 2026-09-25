@@ -1,0 +1,3 @@
+# patient data and generated results stay out of git
+input/
+output/

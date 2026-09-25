@@ -1,571 +1,687 @@
 ---
-title: "Single cell transcriptome analysis 101"
+title: "Single-cell transcriptomics with a sex & gender lens"
+subtitle: "Part 1 - from count matrices to annotated cells (6 PBMC samples)"
 author: "Joana P. Bernardes & Neha Mishra"
-date: "31/05/2022"
-output:   
-  html_document: yes
-  code_download: yes
+date: "MOSAIC-ID workshop 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_download: true
+params:
+  input_dir: "input"               # folder that contains one sub-folder per sample (Cell Ranger output)
+  sample_sheet: "sample_sheet.csv" # one row per sample: sample_id, folder, donor, disease, sex, timepoint
+  ref_dir: "~/References"          # PBMC reference, housekeeping genes, marker list, SingleR references
+  out_dir: "output"
+  solutions: false                 # TRUE renders the instructor version (with solutions)
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 set.seed(33)
 ```
 
-###  Introduction
-  
-#  (1) This practical will perform some of the initial processing steps in a basic scRNA-seq data analysis, including: 
-  
-# - Quality control on the cells
-# - Integration of datasets
-# - Dimensionality reduction
-# - Visualization and clustering
-# - Identification of cell types
+# Introduction
 
-# - Cell proportion
-# - Differential expression analysis
-# - GO enrichment analysis
+In this practical you will perform the first steps of a single-cell RNA-seq
+(scRNA-seq) analysis. Throughout, we will keep asking one question:
+**does sex matter here, and how would we know?**
+
+Part 1 (this notebook):
+
+- Quality control (QC) of the cells
+- Checking the recorded sex of each sample in the data
+- Normalisation, integration of samples, dimensionality reduction
+- Clustering and cell-type annotation
+
+Part 2 (`D3_singleCell_Sex_downstream_2026.Rmd`) covers the downstream analyses
+with a sex-sensitive design:
+
+- Differential abundance (cell proportions)
+- Differential expression, first per cell and then as pseudobulk
+- Enrichment analysis
+
+## Sex and gender: what can we measure?
+
+- **Sex** refers to biological attributes: sex chromosomes, gene expression,
+  hormones and anatomy. Sex is not always binary (e.g. XXY, XO, intersex
+  variations).
+- **Gender** refers to socially constructed roles, behaviours and identities.
+  It shapes exposures, health behaviour and access to care, and through those
+  it can affect immunity.
+
+A transcriptome can tell us something about **sex chromosomes**
+(e.g. *XIST*, chrY genes). It can tell us **nothing about gender**. In clinical
+metadata the column is often called "gender" when it actually holds sex (as it
+did in the 2022 version of this course!). The SAGER guidelines
+(Heidari *et al.*, 2016, *Res Integr Peer Rev*) ask us to use these terms
+correctly, to report how sex was determined, and to report results
+disaggregated by sex.
+
+## Why a sex lens for COVID-19?
+
+- Men have a higher risk of severe COVID-19 and of death.
+- Female and male patients mount different immune responses. Takahashi *et al.*
+  (2020, *Nature*) found that male patients had higher innate cytokines and
+  more non-classical monocytes, while female patients had stronger T-cell
+  activation.
+- Several immune genes lie on the X chromosome (e.g. *TLR7*, *CD40LG*,
+  *CXCR3*). Some of them can escape X inactivation, so females can express
+  them from both X copies.
+- For reviews see Klein & Flanagan (2016, *Nat Rev Immunol*) and Scully *et al.*
+  (2020, *Nat Rev Immunol*).
+
+## Our data
+
+PBMCs (peripheral blood mononuclear cells) from Bernardes *et al.* (2020,
+*Immunity*), 10x Genomics 3' scRNA-seq. The data are available upon request.
+
+| | female | male |
+|---|---|---|
+| COVID-19 | 2 samples | 2 samples |
+| healthy | 1 sample | 1 sample |
+
+> **Exercise 0 (discussion, 5 min).** Look at `sample_sheet.csv`.
+> How many *samples* do we have per group? How many *individuals (donors)*?
+> Which of the two counts is our number of biological replicates? Write down
+> what you expect you *can* and *cannot* conclude about sex differences with
+> this design. We will come back to your answer in Part 2.
+
+In this tutorial we use the R package **Seurat** (v5). Popular alternatives
+include scanpy (Python), scran/scater (Bioconductor) and the book
+[Orchestrating Single-Cell Analysis with Bioconductor (OSCA)](https://bioconductor.org/books/release/OSCA/).
+A list of single-cell tools is maintained
+[here](https://github.com/seandavi/awesome-single-cell).
 
 ---
-## In this tutorial we will mainly use the R package **Seurat**, but there are plenty of alternative packages available, e.g.:
-# - scanpy
-# - scran
-# - simpleSingleCell (very good and comprehensive tutorial for single-cell RNA-seq analysis), 
 
-#A very comprehensive list of available software packages for single-cell genomics analyses can be found
-#[here](https://github.com/seandavi/awesome-single-cell).
+# 0. Setup
 
----------------------------------------------------------------------------------------------------
-  
-## [Seurat](https://satijalab.org/seurat/) is an R package developed and maintained by the Satija lab at NYU, in particular by Andrew Butler, Paul Hoffman, Tim Stuart, Christoph Hafemeister, and Shiwei Zheng, 
-  #designed for QC, analysis, and exploration of single-cell RNA-seq data. Seurat aims to enable users to identify and interpret sources of heterogeneity from single-cell transcriptomic measurements, 
-  #and to integrate diverse types of single-cell data.
-
-
-
-## Goals
-
-# To give you experience with the analysis of single cell RNA sequencing (scRNA-seq) including performing quality control and identifying cell type subsets.
-# To introduce you to scRNA-seq analysis using the Seurat package.
-
-----------------------------------------------------------------------------------------------------
-# load necessary packages and set a folder to load and save your outputs
-```{r}
+```{r libraries}
 library(Seurat)
 library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
 library(RColorBrewer)
 library(org.Hs.eg.db)
-library(clusterProfiler)
+
+# Bioconductor packages mask some dplyr verbs (e.g. AnnotationDbi::select, matrixStats::count)
+select <- dplyr::select; count <- dplyr::count; filter <- dplyr::filter
+
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+ref_dir <- path.expand(params$ref_dir)
+```
+
+# 1. Load the data
+
+## 1.1 The sample sheet
+
+We describe every sample **once** in a sample sheet instead of typing the
+metadata by hand for each object. This is less work and avoids copy-paste
+errors, such as assigning the wrong sex to a sample.
+
+```{r sample-sheet}
+samples <- read.csv(params$sample_sheet, stringsAsFactors = FALSE)
+samples
+
+stopifnot(
+  "Please fill in the FILL_ME fields of the sample sheet" = !any(samples == "FILL_ME", na.rm = TRUE),
+  "sex must be 'female' or 'male'"         = all(samples$sex %in% c("female", "male")),
+  "disease must be 'healthy' or 'COVID19'" = all(samples$disease %in% c("healthy", "COVID19")),
+  "sample_id must be unique"               = !any(duplicated(samples$sample_id))
+)
+
+table(samples$disease, samples$sex)                  # samples per group
+table(unique(samples[, c("donor", "disease", "sex")])[, c("disease", "sex")]) # donors per group
+```
+
+## 1.2 Read the 10x count matrices
+
+Cell Ranger writes two matrices per sample:
+
+- `raw_feature_bc_matrix`: **all** barcodes, including empty droplets
+- `filtered_feature_bc_matrix`: only barcodes that Cell Ranger called as cells
+
+We use the filtered matrix when it is there. Otherwise we use the raw matrix and
+rely on `min.features = 200` to drop most empty droplets. That is a crude
+filter; `DropletUtils::emptyDrops()` is the proper tool.
+
+```{r read10x}
+read_sample <- function(folder) {
+  base <- file.path(params$input_dir, folder)
+  mdir <- c(file.path(base, "filtered_feature_bc_matrix"),
+            file.path(base, "raw_feature_bc_matrix"),
+            base)
+  mdir <- mdir[file.exists(mdir)][1]
+  if (is.na(mdir)) stop("No count matrix found for ", folder)
+  message("Reading ", mdir)
+  counts <- Read10X(data.dir = mdir)
+  if (is.list(counts)) counts <- counts[["Gene Expression"]]  # CITE-seq / multiome output
+  counts
+}
+
+seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
+  obj <- CreateSeuratObject(counts = read_sample(samples$folder[i]),
+                            project = samples$sample_id[i],
+                            min.cells = 3, min.features = 200)
+  # add the sample-level metadata to every cell
+  for (col in c("sample_id", "donor", "disease", "sex", "timepoint")) obj[[col]] <- samples[i, col]
+  obj
+})
+names(seurat_list) <- samples$sample_id
+
+sapply(seurat_list, ncol)  # cells per sample
+```
+
+> **Exercise 1.1.** Pick one object, e.g. `seurat_list$HC_M`.
+> What does `dim()` return? Which number is cells and which is genes?
+> Where are the counts stored (`Layers()`, `LayerData()`)? Where is the
+> cell metadata stored (`@meta.data`)?
+
+```{r ex1.1-solution, eval=params$solutions, include=params$solutions}
+dim(seurat_list$HC_M)                  # genes x cells
+Layers(seurat_list$HC_M)               # "counts"
+LayerData(seurat_list$HC_M, layer = "counts")[1:5, 1:5]
+head(seurat_list$HC_M@meta.data)
+```
+
+## 1.3 Merge the samples into one object
+
+`merge()` keeps the samples as separate *layers*, which we need later for
+integration. We prefix the cell barcodes with the sample ID so that barcodes
+are unique across samples.
+
+```{r merge}
+obj <- merge(x = seurat_list[[1]], y = seurat_list[-1],
+             add.cell.ids = names(seurat_list), project = "D3_sex")
+rm(seurat_list); invisible(gc())
+obj
+Layers(obj)
+```
+
+# 2. Quality control
+
+## 2.1 QC metrics
+
+- `nFeature_RNA`: number of genes detected per cell
+- `nCount_RNA`: number of UMIs per cell
+- `percent.mt`: % of UMIs from mitochondrial genes (high in stressed or dying cells)
+- `percent.ribo`: % of UMIs from ribosomal protein genes
+- `percent.hk`: % of UMIs from housekeeping genes (low in poor-quality cells)
+
+```{r qc-metrics}
+obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+
+hk_file <- file.path(ref_dir, "Housekeeping_Hs.csv")
+if (file.exists(hk_file)) {
+  hkgenes <- toupper(read.csv(hk_file, header = TRUE)$V1)
+  hkgenes.found <- rownames(obj)[toupper(rownames(obj)) %in% hkgenes]
+  obj[["percent.hk"]] <- PercentageFeatureSet(obj, features = hkgenes.found)
+} else {
+  message("Housekeeping list not found - percent.hk will not be used")
+}
+qc_features <- intersect(c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo", "percent.hk"),
+                         colnames(obj@meta.data))
+```
+
+> **Question.** Where were `percent.mt` and `percent.hk` saved in the object?
+
+## 2.2 Visualise the unfiltered data
+
+```{r qc-vln-before, fig.width=14, fig.height=4}
+VlnPlot(obj, features = qc_features, group.by = "sample_id",
+        ncol = length(qc_features), pt.size = 0)
+```
+
+```{r qc-scatter, fig.width=10, fig.height=4}
+FeatureScatter(obj, "nCount_RNA", "nFeature_RNA", group.by = "sample_id", raster = TRUE) +
+FeatureScatter(obj, "nCount_RNA", "percent.mt",   group.by = "sample_id", raster = TRUE)
+```
+
+> **Exercise 2.1 (sex lens on QC).** Plot the QC metrics grouped by `sex`
+> and by `disease` instead of `sample_id`. Do female and male samples
+> differ? If they did, would it be technical (a batch processed on another
+> day) or biological? Why does it matter that we use the **same** thresholds
+> for all groups?
+
+```{r ex2.1-solution, eval=params$solutions, include=params$solutions, fig.width=14, fig.height=4}
+VlnPlot(obj, features = qc_features, group.by = "sex",     ncol = length(qc_features), pt.size = 0)
+VlnPlot(obj, features = qc_features, group.by = "disease", ncol = length(qc_features), pt.size = 0)
+obj@meta.data %>% group_by(sample_id, sex, disease) %>%
+  summarise(across(all_of(qc_features), median), n_cells = n(), .groups = "drop")
+```
+
+## 2.3 Filter: keep high-quality cells
+
+```{r qc-filter}
+max_features <- 5000   # very high numbers of genes may indicate doublets
+min_features <- 200
+max_mt       <- 25     # PBMCs from COVID-19 patients can have more mt reads - check your plots!
+min_hk       <- 10
+
+cells_before <- table(obj$sample_id)
+keep <- obj$nFeature_RNA > min_features & obj$nFeature_RNA < max_features & obj$percent.mt < max_mt
+if ("percent.hk" %in% qc_features) keep <- keep & obj$percent.hk > min_hk
+obj <- subset(obj, cells = colnames(obj)[keep])
+
+data.frame(before = as.vector(cells_before),
+           after  = as.vector(table(obj$sample_id)[names(cells_before)]),
+           row.names = names(cells_before)) %>%
+  mutate(pct_kept = round(100 * after / before, 1))
+```
+
+```{r qc-vln-after, fig.width=14, fig.height=4}
+VlnPlot(obj, features = qc_features, group.by = "sample_id",
+        ncol = length(qc_features), pt.size = 0)
+```
+
+> **Exercise 2.2.** Fixed thresholds are a choice. An alternative is
+> *per-sample, data-driven* thresholds, e.g. removing cells more than 3
+> median absolute deviations (MADs) from the sample median. Compute the
+> 3-MAD upper limit of `percent.mt` for each sample. Would it change which
+> cells are removed? Does it remove more cells from one sex or one disease
+> group?
+
+```{r ex2.2-solution, eval=params$solutions, include=params$solutions}
+obj@meta.data %>%
+  group_by(sample_id, sex, disease) %>%
+  summarise(median_mt = median(percent.mt),
+            mad3_upper = median(percent.mt) + 3 * mad(percent.mt),
+            pct_above  = round(100 * mean(percent.mt > median(percent.mt) + 3 * mad(percent.mt)), 1),
+            .groups = "drop")
+```
+
+# 3. Check the recorded sex in the data
+
+Sample swaps and wrong metadata are common. Our samples come from different
+individuals, so we can check the recorded sex with sex-chromosome genes:
+
+- *XIST* (X-inactive specific transcript) is expressed from the inactive X, so
+  only in cells with two or more X chromosomes.
+- chrY genes (*RPS4Y1*, *DDX3Y*, *UTY*, *KDM5D*, *EIF1AY*, ...) are expressed
+  only when a Y chromosome is present.
+
+```{r normalize}
+obj <- NormalizeData(obj)
+```
+
+```{r sex-check, fig.width=11, fig.height=4}
+y_genes <- intersect(c("RPS4Y1", "DDX3Y", "UTY", "KDM5D", "EIF1AY", "USP9Y", "ZFY", "TXLNGY", "NLGN4Y"),
+                     rownames(obj))
+obj <- JoinLayers(obj)            # one matrix for all cells (we split again for integration)
+expr <- LayerData(obj, layer = "data")
+obj$XIST_expr  <- expr["XIST", ]
+obj$chrY_score <- Matrix::colMeans(expr[y_genes, , drop = FALSE])
+
+sex_check <- obj@meta.data %>%
+  group_by(sample_id, donor, recorded_sex = sex) %>%
+  summarise(XIST = mean(XIST_expr), chrY = mean(chrY_score),
+            pct_XIST_pos = round(100 * mean(XIST_expr > 0), 1),
+            pct_chrY_pos = round(100 * mean(chrY_score > 0), 1), .groups = "drop") %>%
+  mutate(inferred_sex = case_when(XIST > chrY ~ "female", chrY > XIST ~ "male", TRUE ~ "unclear"),
+         match = inferred_sex == recorded_sex)
+sex_check
+
+ggplot(sex_check, aes(XIST, chrY, colour = recorded_sex, label = sample_id)) +
+  geom_point(size = 4) + geom_text(vjust = -1, size = 3) +
+  scale_colour_manual(values = c(female = "#E69F00", male = "#009E73")) +
+  labs(x = "mean XIST (log-normalised)", y = "mean chrY genes", title = "Sample-level sex check") +
+  theme_bw() |
+VlnPlot(obj, features = c("XIST", "RPS4Y1"), group.by = "sample_id", pt.size = 0, ncol = 2)
+
+if (!all(sex_check$match)) warning("Recorded and inferred sex disagree for: ",
+                                   paste(sex_check$sample_id[!sex_check$match], collapse = ", "))
+```
+
+> **Exercise 3.1 (discussion).**
+>
+> 1. Do the recorded and the inferred sex agree for all samples?
+> 2. Some cells from male samples show a little *XIST*, and some cells
+>    from female samples show chrY reads. Where could that come from?
+>    (Think of ambient RNA, doublets, and pooled or multiplexed samples.)
+> 3. Blood cells of older men often lose the Y chromosome (*mosaic loss of
+>    chromosome Y*, LOY). How would LOY show up in this plot?
+> 4. What would you conclude about a sample with high *XIST* **and** high
+>    chrY expression (e.g. XXY, Klinefelter syndrome)? About a trans woman
+>    on hormone therapy?
+> 5. Can we infer **gender** from these data?
+
+```{asis, echo=params$solutions}
+**Discussion notes (instructor).** (2) Ambient RNA in the droplets and
+doublets give low-level off-target signal; pooled samples from mixed sexes
+would give many cells of each kind. (3) With LOY, the fraction of chrY+
+cells drops in male samples while *XIST* stays off. (4) Sex-chromosome
+genes tell us karyotype-related expression only. Hormone therapy does not
+change the karyotype; hormone-responsive genes may change. (5) No: gender is
+social and cannot be read from a transcriptome. We must ask people, and
+record the answer with their consent.
+```
+
+# 4. Normalisation, variable genes and integration
+
+## 4.1 Variable genes: keep sex-chromosome genes out
+
+*XIST* and the chrY genes differ strongly between female and male cells. If
+they are among the highly variable genes (HVGs), some principal components
+can split cells **by sex** instead of by cell type. Here we want clusters to
+be cell types, so we remove *XIST*/*TSIX* and chrY genes from the HVGs. They
+stay in the data for the downstream analyses.
+
+```{r gene-chr}
+# chromosome of each gene (used again in Part 2)
+valid <- intersect(rownames(obj), keys(org.Hs.eg.db, keytype = "SYMBOL"))
+gene_chr <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = valid, keytype = "SYMBOL", column = "CHR",
+                                  multiVals = function(x) paste(sort(unique(x)), collapse = ";"))
+gene_chr <- setNames(ifelse(is.na(gene_chr[rownames(obj)]), "unknown", gene_chr[rownames(obj)]), rownames(obj))
+table(gene_chr)[c("X", "Y", "X;Y")]   # "X;Y" = pseudo-autosomal genes
+sex_chr_genes <- names(gene_chr)[gene_chr %in% c("Y", "X;Y") | names(gene_chr) %in% c("XIST", "TSIX")]
+```
+
+```{r split-hvg}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$sample_id)  # one layer per sample for integration
+obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+
+intersect(VariableFeatures(obj), sex_chr_genes)          # which sex genes were highly variable?
+VariableFeatures(obj) <- setdiff(VariableFeatures(obj), sex_chr_genes)
+length(VariableFeatures(obj))
+```
+
+> **Exercise 4.1.** Which sex-chromosome genes were among the HVGs?
+> Skip the `setdiff()` step, run the PCA below and colour the PCs by `sex`
+> (`DimPlot(obj, reduction = "pca", group.by = "sex", dims = c(i, j))` or
+> `DimHeatmap()`). Does any PC separate the sexes? Is removing these genes
+> always a good idea? When would you keep them?
+
+## 4.2 Scale, PCA and the unintegrated UMAP
+
+> **Question.** What does `ScaleData()` actually do (`?ScaleData`)? Why do we
+> only scale the variable genes?
+
+```{r pca, fig.width=6, fig.height=4}
+obj <- ScaleData(obj)
+obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
+ElbowPlot(obj, ndims = 50)
+```
+
+```{r umap-unintegrated, fig.width=12, fig.height=5}
+n_pcs <- 30
+obj <- RunUMAP(obj, dims = 1:n_pcs, reduction = "pca", reduction.name = "umap.unintegrated")
+DimPlot(obj, reduction = "umap.unintegrated", group.by = "sample_id") +
+DimPlot(obj, reduction = "umap.unintegrated", group.by = "sex")
+```
+
+## 4.3 Integration of the 6 samples
+
+Every sample was processed separately, so part of the variation between
+samples is technical (a batch effect). Integration aligns the shared cell
+types across samples. We use reciprocal PCA (RPCA), which is fast. CCA (used in
+the 2022 course) and Harmony are alternatives.
+
+**Caution:** each sample is its own batch *and* its own donor, sex and disease
+group. Integration may therefore also remove some real biology. We use
+the integrated space **only** for clustering and visualisation. All
+differential analyses in Part 2 use the uncorrected counts.
+
+```{r integrate}
+obj <- IntegrateLayers(obj, method = RPCAIntegration, orig.reduction = "pca",
+                       new.reduction = "integrated.rpca", verbose = FALSE)
+obj <- JoinLayers(obj)   # re-join the layers after integration
+obj <- RunUMAP(obj, reduction = "integrated.rpca", dims = 1:n_pcs, reduction.name = "umap")
+```
+
+```{r umap-integrated, fig.width=15, fig.height=4.5}
+DimPlot(obj, reduction = "umap", group.by = "sample_id") +
+DimPlot(obj, reduction = "umap", group.by = "sex", cols = c(female = "#E69F00", male = "#009E73")) +
+DimPlot(obj, reduction = "umap", group.by = "disease")
+```
+
+> **Exercise 4.2.** Compare the unintegrated and the integrated UMAP. Which
+> samples looked most different before integration? After integration, do
+> female and male cells mix within every region of the UMAP? Where do they not
+> mix, and what could that mean?
+
+```{r ex4.2-solution, eval=params$solutions, include=params$solutions, fig.width=10, fig.height=5}
+DimPlot(obj, reduction = "umap", split.by = "sex", group.by = "disease")
+```
+
+## 4.4 Clustering
+
+```{r clusters, fig.width=15, fig.height=5}
+obj <- FindNeighbors(obj, reduction = "integrated.rpca", dims = 1:n_pcs)
+for (res in c(0.1, 0.2, 0.3)) obj <- FindClusters(obj, resolution = res, verbose = FALSE)
+DimPlot(obj, group.by = "RNA_snn_res.0.1", label = TRUE) + NoLegend() + ggtitle("res 0.1") |
+DimPlot(obj, group.by = "RNA_snn_res.0.2", label = TRUE) + NoLegend() + ggtitle("res 0.2") |
+DimPlot(obj, group.by = "RNA_snn_res.0.3", label = TRUE) + NoLegend() + ggtitle("res 0.3")
+```
+
+> **Exercise 4.3.** What happens to the clusters when you change the
+> resolution? Which resolution would you choose, and why? Try 0.5 and 1.
+
+**IMPORTANT: choose a cluster resolution.**
+
+```{r choose-res, fig.width=6, fig.height=5}
+obj$seurat_clusters <- obj$RNA_snn_res.0.2
+Idents(obj) <- "seurat_clusters"
+DimPlot(obj, reduction = "umap", label = TRUE)
+```
+
+## 4.5 Sample and sex distribution per cluster
+
+```{r cluster-composition, fig.width=12, fig.height=4}
+ggplot(obj@meta.data, aes(x = seurat_clusters, fill = sample_id)) +
+  geom_bar(position = "fill") + ylab("fraction of cells") + theme_bw() +
+ggplot(obj@meta.data, aes(x = seurat_clusters, fill = sex)) +
+  geom_bar(position = "fill") + ylab("fraction of cells") + theme_bw() +
+  scale_fill_manual(values = c(female = "#E69F00", male = "#009E73"))
+```
+
+```{r cluster-qc, fig.width=15, fig.height=4}
+VlnPlot(obj, features = qc_features, ncol = length(qc_features), pt.size = 0)
+```
+
+> **Question.** Is any cluster made up mostly of one sample or one sex? Is
+> any cluster defined by poor QC (high `percent.mt`, low `nFeature_RNA`)?
+
+# 5. Cell-type annotation
+
+## 5.1 Reference mapping (Azimuth PBMC reference, Hao *et al.* 2021)
+
+```{r ref-mapping, fig.width=14, fig.height=5}
+ref_file <- file.path(ref_dir, "PBMCs_SeuratV4.rda")
+has_reference <- file.exists(ref_file)
+
+if (has_reference) {
+  load(ref_file)                                   # loads the object `reference`
+  reference <- UpdateSeuratObject(reference)
+  query <- SCTransform(obj, verbose = FALSE)
+  anchors <- FindTransferAnchors(reference = reference, query = query,
+                                 normalization.method = "SCT",
+                                 reference.reduction = "spca",
+                                 recompute.residuals = FALSE, dims = 1:50)
+  query <- MapQuery(anchorset = anchors, query = query, reference = reference,
+                    refdata = list(celltype.l1 = "celltype.l1", celltype.l2 = "celltype.l2"),
+                    reference.reduction = "spca", reduction.model = "wnn.umap")
+  obj$celltype.l1 <- query$predicted.celltype.l1
+  obj$celltype.l2 <- query$predicted.celltype.l2
+  obj$celltype.l2.score <- query$predicted.celltype.l2.score
+  rm(query, anchors, reference); invisible(gc())
+
+  print(DimPlot(obj, group.by = "celltype.l1", label = TRUE, repel = TRUE) +
+        DimPlot(obj, group.by = "celltype.l2", label = FALSE))
+} else {
+  message("Reference not found at ", ref_file, " - skipping reference mapping.")
+}
+```
+
+Alternative: `Azimuth::RunAzimuth(obj, reference = "pbmcref")` downloads the
+same reference and runs these steps in one call.
+
+## 5.2 SingleR (optional)
+
+```{r singler, eval = requireNamespace("SingleR", quietly = TRUE) && file.exists(file.path(path.expand(params$ref_dir), "Reference_dmap.RDS")), fig.width=12, fig.height=5}
 library(SingleR)
-library(reshape2)
-library(tidyr)
-library(dplyr)
-setwd('~/a/b/c')
-```
+dmap.se <- readRDS(file.path(ref_dir, "Reference_dmap.RDS"))
+hpca.se <- readRDS(file.path(ref_dir, "Reference_hpca.RDS"))
 
-
-# 1.  PBMC data set from Bernardes et al. > Peripheral Blood Mononuclear Cells (PBMC) freely available upon request.
-
-# 1.1. Load data: 4 samples
-```{r}
-dirname <- "/input/"
-counts_matrix_filename = paste0(dirname,"J11987_002_TA_/raw_feature_bc_matrix/")
-counts_matrix_filename2 = paste0(dirname,"J11988_002_TA2/raw_feature_bc_matrix/")
-counts_matrix_filename3 = paste0(dirname,"J11989_007_rec/raw_feature_bc_matrix/")
-counts_matrix_filename4 = paste0(dirname,"J15438_H013_control/raw_feature_bc_matrix/")
-
-Sample1 <- Read10X(data.dir = counts_matrix_filename) 
-Sample2 <- Read10X(data.dir = counts_matrix_filename2) 
-Sample3 <- Read10X(data.dir = counts_matrix_filename3) 
-Sample4 <- Read10X(data.dir = counts_matrix_filename4) 
-
-
-P002_covid<-CreateSeuratObject(counts = Sample1, min.cells = 3, min.features = 200, project = "P002_covid")
-P002_covid2<-CreateSeuratObject(counts = Sample2, min.cells = 3, min.features = 200, project = "P002_covid2")
-P007_rec<-CreateSeuratObject(counts = Sample3, min.cells = 3, min.features = 200, project = "P007_rec")
-H013_control<-CreateSeuratObject(counts = Sample4, min.cells = 3, min.features = 200, project = "H013_control")
-```
-
-# Take a minute to understand the backbone of the S4 object
-
-# 1.2. Check the data
-```{r}
-dim(H013_control)
-```
-
-# What do the 12088 correspond to? Cells? Genes?
-
-# 1.3. Quality control (QC) cells per sample: filter out low quality cells
-# Mitochondria
-```{r}
-H013_control[["percent.mt"]] <- PercentageFeatureSet(H013_control, pattern = "^MT-")
-```
-
-# Where was the percent.mt saved in the S4 object?
-
-# Housekeeping genes
-```{r}
-Genes<-read.csv('~/References/Housekeeping_Hs.csv', head=T)
-hkgenes <- as.vector(Genes$V1)
-hkgenes.found <- which(toupper(rownames(GetAssayData(object = H013_control))) %in% hkgenes)
-n.expressed.hkgenes <- Matrix::colSums(GetAssayData(object = H013_control[hkgenes.found, ] )> 0)
-H013_control[['percent.hk']] <- PercentageFeatureSet(H013_control, features = n.expressed.hkgenes)
-```
-
-# Where was the percentage.hk saved in the S4 object?
-
-# Visualize the unfiltered data
-```{r}
-VlnPlot(object = H013_control, features = c( "nFeature_RNA", "nCount_RNA","percent.mt","percent.hk"), ncol =  4, pt.size = 0.1)
-```
-
-
-# filter data > select for high quality cells
-```{r}
-H013_control <- subset(H013_control, subset = nFeature_RNA < 5000 & nFeature_RNA > 200 & percent.mt < 25 & percent.hk > 10)
-dim(H013_control)
-```
-# What changed in the object?
-
-
-
-# Visualize the filtered data
-```{r}
-VlnPlot(object = H013_control, features = c( "nFeature_RNA", "nCount_RNA","percent.mt","percent.hk"), ncol =  4, pt.size = 0.1)
-
-```
-
-
-# 1.5. Add Metada of interest: check infotable provided
-```{r}
-H013_control$Patient<-"H013"
-H013_control$Disease<-"healthy"
-H013_control$Status<-"no disease"
-H013_control$Timepoint<-"TA"
-H013_control$Gender<-"male"
-```
-
-### Repeat this workflow for tha additional samples!
-Check dim() for each object
-P002_covid > 8514 cells
-P002_covid2 > 11024 cells
-P007_rec > 9352 cells
-H013_control > 12088 cells
-
-# 1.6. Save the individual samples
-```{r}
-save(P002_covid, P002_covid2, P007_rec, H013_control, file = 'Single_samples_QC.rda')
-```
-
-
-
-# 2. Integration of samples
-# 2.1 Simple merge: there is a chance to have duplicated cell names > rename samples
-```{r}
-P002_covid <- RenameCells(object = P002_covid, add.cell.id = "P002_covid")
-P002_covid2 <- RenameCells(object = P002_covid2, add.cell.id = "P002_covid2")
-P007_rec <- RenameCells(object = P007_rec, add.cell.id = "P007_rec")
-H013_control <- RenameCells(object = H013_control, add.cell.id = "P034")
-
-Object_simple<-merge(x = P002_covid, y = c(P002_covid2, P007_rec, H013_control))
-```
-
-# 2.2 Merge with batch correction
-```{r}
-# Merge batch corrected
-Object_sep<-SplitObject(Object_simple, split.by = 'Patient')
-for(i in 1:length(Object_sep)) {
-  Object_sep[[i]] <- NormalizeData(Object_sep[[i]], verbose = F)
-  Object_sep[[i]] <- FindVariableFeatures(Object_sep[[i]], selection.method = 'vst', verbose = F)
-}
-ref_Object<-Object_sep[c('P002','P007','H013')]
-Object_V3_anchors<-FindIntegrationAnchors(object.list = ref_Object, dims = 1:60)
-Object_V3<-IntegrateData(anchorset = Object_V3_anchors, dims=1:60)
-```
-
-# 1.6. Save the Merge object
-```{r}
-save(Object_V3, file = 'Object_V3.rda')
-```
-
-
-
-Normalize and Scale the filter object
-# What does ScaleData() actually do?
-```{r}
-?ScaleData
-all.genes<-rownames(Object_V3)
-Object_V3 <- ScaleData(Object_V3, features = all.genes)
-```
-
-
-# 1.5. Identify variable genes
-```{r}
-Object_V3 <- FindVariableFeatures(Object_V3,  selection.method = "vst", nfeatures = 2000)
-```
-
-# 1.6. Dimensionality reduction > PCA 
-```{r, fig.width = 6, fig.height = 5}
-Object_V3 <- RunPCA(Object_V3,npcs = 80, ndims.print = 1:5)
-ElbowPlot(Object_V3, ndims = 80)
-```
-
-
-# 1.7. Data visualization
-```{r, fig.width = 6, fig.height = 5}
-Object_V3 <- RunUMAP(object = Object_V3, dims = 1:50)
-DimPlot(Object_V3, reduction = "umap", label=FALSE)
-```
-```{r, fig.width = 6, fig.height = 5}
-DimPlot(Object_V3, group.by = "Patient", reduction = "umap", label=FALSE)
-DimPlot(Object_V3, group.by = "Disease", reduction = "umap", label=FALSE)
-DimPlot(Object_V3, group.by = "Status", reduction = "umap", label=FALSE)
-DimPlot(Object_V3, group.by = "Timepoint", reduction = "umap", label=FALSE)
-```
-
-
-# 1.8. Cluster calling 
-```{r, fig.width = 6, fig.height = 5}
-Object_V3 <- FindNeighbors(Object_V3, dims = 1:50)
-Object_V3 <- FindClusters(Object_V3, resolution = 0.2)
-DimPlot(Object_V3, reduction = "umap", label=T)
-```
-
-# Try to change the resolution. What happened to the clusters?
-```{r, fig.width = 6, fig.height = 5}
-Object_V3 <- FindClusters(Object_V3, resolution = 0.1)
-DimPlot(Object_V3, reduction = "umap", label=T)
-```
-
-# Try to change the resolution. What happened to the clusters?
-```{r, fig.width = 6, fig.height = 5}
-Object_V3 <- FindClusters(Object_V3, resolution = 0.3)
-DimPlot(Object_V3, reduction = "umap", label=T)
-```
-
-# IMPORTANT: choose cluster resolution
-```{r, fig.width = 6, fig.height = 5}
-Idents(Object_V3)<-Object_V3$integrated_snn_res.0.2
-Object_V3$seurat_clusters<-Object_V3$integrated_snn_res.0.2
-DimPlot(Object_V3, reduction = "umap", label=T)
-```
-
-
-
-# 1.9. sample distribuition
-```{r}
-ggplot(Object_V3@meta.data, aes(x=integrated_snn_res.0.2, fill=orig.ident)) + geom_bar()
-```
-
-```{r, fig.width = 15, fig.height = 4}
-VlnPlot(object = Object_V3,, features = c( "nFeature_RNA", "nCount_RNA","percent.mt","percent.hk"), ncol =  4, pt.size = 0)
-```
-
-
-# 2.1. Assign cell type- reference-query
-```{r, fig.width = 6, fig.height = 5}
-load("~/References/PBMCs_SeuratV4.rda")
-query <- SCTransform(Object_V3, verbose = FALSE)
-
-anchors <- FindTransferAnchors(
-  reference = reference,
-  query = query,
-  normalization.method = "SCT",
-  reference.reduction = "spca",
-  recompute.residuals=FALSE,
-  dims = 1:15
-)
-
-query <- MapQuery(
-  anchorset = anchors,
-  query = query,
-  reference = reference,
-  refdata = list(
-    celltype.l1 = "celltype.l1",
-    celltype.l2 = "celltype.l2",
-    predicted_ADT = "ADT"
-  ),
-  reference.reduction = "spca", 
-  reduction.model = "wnn.umap"
-)
-
-
-```
-
-# Asign cell annotations to object
-```{r, fig.width = 6, fig.height = 5}
-Object_V3$celltype.l1<-query$predicted.celltype.l1
-DimPlot(Object_V3, reduction = "umap",group.by = 'celltype.l1', label=TRUE, repel = TRUE)
-```
-
-```{r, fig.width = 8, fig.height = 5}
-Object_V3$celltype.l2<-query$predicted.celltype.l2
-DimPlot(Object_V3, reduction = "umap",group.by = 'celltype.l2', label=FALSE, repel = TRUE)
-```
-# 2.2 SingleR reference
-```{r}
-dmap.se <- readRDS('~/References/Reference_dmap.RDS')
-hpca.se <- readRDS('~/Reference_hpca.RDS')
-
-input <- as.matrix(GetAssayData(object = Object_V3, slot = "data", assay = "RNA"))
-singleR.list <- list()
-singleR.list$hpca <- SingleR(test = input, 
-                             method="single",
-                             fine.tune=FALSE,
-                             ref = hpca.se, 
-                             labels = hpca.se$label.main)
-singleR.list$dmap <- SingleR(test = input, 
-                             method="single",
-                             fine.tune=FALSE,
-                             ref = dmap.se, 
-                             labels = dmap.se$label.main)
+input <- LayerData(obj, assay = "RNA", layer = "data")  # keep it sparse: as.matrix() needs >10 GB here
+obj$hpca.labels <- SingleR(test = input, ref = hpca.se, labels = hpca.se$label.main)$labels
+obj$dmap.labels <- SingleR(test = input, ref = dmap.se, labels = dmap.se$label.main)$labels
 rm(input)
-Object_V3$hpca.labels <- singleR.list$hpca$labels
-Object_V3$dmap.labels <- singleR.list$dmap$labels
+
+DimPlot(obj, group.by = "hpca.labels", label = TRUE, repel = TRUE) +
+DimPlot(obj, group.by = "dmap.labels")
 ```
 
-```{r, fig.width = 6, fig.height = 5}
-DimPlot(object = Object_V3, reduction = 'umap', label = TRUE, group.by ="hpca.labels")
-```
+## 5.3 Marker genes
 
-```{r, fig.width = 6, fig.height = 5}
-DimPlot(object = Object_V3, reduction = 'umap', label = FALSE, group.by ="dmap.labels")
-```
-
-
-# 2.3. Assign cell type- in house markers
-```{r, fig.width = 8, fig.height = 7}
-markers<-read.csv('~/References/PBMCs_marker.csv', header = T, sep=';')
-
-Idents(Object_V3)<-Object_V3$integrated_snn_res.0.2
-color<-c("#B2182B", "#D6604D", "#F4A582", "#FDDBC7", "#F7F7F7", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC")
-
-DotPlot(Object_V3, features=markers$GeneMarker,  dot.scale = 6, assay = 'RNA') +
-  scale_color_gradientn(colours  = rev(color)) + coord_flip() + scale_y_discrete(position = "right") +
-  theme(axis.text.x =element_text(size=14, angle = 60, hjust = 0))
-```
-
-# Merge information
-```{r}
-# Confusion Matrix
-confusionMatrix <- function (i = NULL, j = NULL) 
-{
-  ui <- unique(i)
-  uj <- unique(j)
-  m <- Matrix::sparseMatrix(i = match(i, ui), j = match(j, 
-    uj), x = rep(1, length(i)), dims = c(length(ui), length(uj)))
-  rownames(m) <- ui
-  colnames(m) <- uj
-  m
-}
-
-cells_cluster <- confusionMatrix(paste0(Object_V3$seurat_clusters),
-                                 paste0(Object_V3$celltype.l2))
-
-cells_cluster <- cells_cluster[order(factor(rownames(cells_cluster),levels=c(0:nrow(cells_cluster)))),]
-
-
-scaled_cM <-as.matrix(round((cells_cluster / Matrix::rowSums(cells_cluster))*100,2))
-
-scaled_cM <- scaled_cM[,c("CD4 Naive", "CD4 TCM",  "CD4 TEM",  "CD4 CTL",  "CD4 Proliferating",
-              "CD8 Naive", "CD8 TCM", "CD8 TEM", "CD8 Proliferating", 
-              "Treg",
-              "gdT", 
-              "MAIT",  
-              "dnT",
-              "B naive", "B intermediate", "B memory", "Plasmablast",
-              "NK", "NK Proliferating", "NK_CD56bright", 
-              "ILC" ,
-              "CD14 Mono",
-              "CD16 Mono",
-              "cDC2",
-              "pDC",   
-              "ASDC", 
-              "Platelet", 
-              "Eryth", 
-              "HSPC",  
-              "Doublet")]
-
-tmp <- as.data.frame(scaled_cM[,colSums(scaled_cM)>=5])
-others <- scaled_cM[,colSums(scaled_cM)<5] 
-tmp$others <- as.vector(rowSums(others))
-
-pheatmap::pheatmap(
-  mat = as.matrix(tmp),
-  border_color = "black",
-  display_numbers = TRUE,
-  number_color = "white",
-  color = c("white",brewer.pal(n = 9, name = "YlOrRd")),
-  cluster_cols=FALSE,
-  cluster_rows = FALSE
+```{r markers, fig.width=9, fig.height=10}
+canonical_markers <- list(
+  "CD4+ T cells"       = c("CD3E", "CD4", "IL7R"),
+  "CD8+ T cells"       = c("CD3E", "CD8A", "CD8B"),
+  "other T cells"      = c("TRDC", "TRGC1", "SLC4A10"),
+  "NK cells"           = c("NKG7", "GNLY", "KLRD1"),
+  "B cells"            = c("MS4A1", "CD79A", "CD19"),
+  "Plasmablasts"       = c("MZB1", "JCHAIN", "XBP1"),
+  "CD14 Monocytes"     = c("CD14", "LYZ", "S100A8"),
+  "CD16 Monocytes"     = c("FCGR3A", "MS4A7", "CDKN1C"),
+  "DC"                 = c("FCER1A", "CD1C", "CLEC10A", "LILRA4"),
+  "Megakaryocytes"     = c("PPBP", "PF4", "GP9"),
+  "Prolif Lymphocytes" = c("MKI67", "TOP2A"),
+  "HSPC"               = c("CD34")
 )
+canonical_markers <- Filter(length, lapply(canonical_markers, intersect, rownames(obj)))
+
+marker_file <- file.path(ref_dir, "PBMCs_marker.csv")
+marker_genes <- if (file.exists(marker_file)) {
+  read.csv(marker_file, header = TRUE, sep = ";")$GeneMarker
+} else unlist(canonical_markers)
+marker_genes <- unique(intersect(marker_genes, rownames(obj)))
+
+color <- c("#B2182B", "#D6604D", "#F4A582", "#FDDBC7", "#F7F7F7", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC")
+DotPlot(obj, features = marker_genes, group.by = "seurat_clusters", dot.scale = 6) +
+  scale_color_gradientn(colours = rev(color)) + coord_flip() + scale_y_discrete(position = "right") +
+  theme(axis.text.x = element_text(size = 12))
 ```
 
-# Change cluster numbers by cells types based on the results above ("CD4+ T cells","CD8+ Tcells","NK cells","Prolif Lymphocytes ,"other T cells","CD14 Monocytes","CD16 Monocytes", "DC", "B cells", "Plasmablasts", "Megakaryocytes")
-```{r}
-Idents(Object_V3)<-Object_V3$seurat_clusters
-new.cluster.ids <- c( "0", "1", "2", "3", "4",
-                      "5", "6", "7", "8", "9",
-                      "10", "11", "12", "13", "14",
-                      "15", "16", "17", "18", "19",
-                      "20", "21")
-names(new.cluster.ids) <- levels(Object_V3)
-Object_V3 <- RenameIdents(Object_V3, new.cluster.ids)
-Object_V3$CellTypes<-Idents(Object_V3)
+## 5.4 Combine the evidence
+
+```{r confusion, fig.width=12, fig.height=6, eval=has_reference}
+cells_cluster <- table(cluster = obj$seurat_clusters, label = obj$celltype.l2)
+scaled_cM <- round(100 * prop.table(cells_cluster, margin = 1), 1)
+scaled_cM <- scaled_cM[, colSums(scaled_cM) > 0, drop = FALSE]
+
+tmp <- as.data.frame.matrix(scaled_cM[, colSums(scaled_cM) >= 5, drop = FALSE])
+tmp$others <- rowSums(scaled_cM[, colSums(scaled_cM) < 5, drop = FALSE])
+
+pheatmap::pheatmap(as.matrix(tmp), border_color = "black", display_numbers = TRUE,
+                   number_color = "black", color = c("white", brewer.pal(9, "YlOrRd")),
+                   cluster_cols = FALSE, cluster_rows = FALSE,
+                   main = "% of cells in each cluster (rows) per reference label (columns)")
 ```
 
+> **Exercise 5.1.** Use the DotPlot and the heatmap to name each cluster
+> with one of: "CD4+ T cells", "CD8+ T cells", "other T cells", "NK cells",
+> "Prolif Lymphocytes", "B cells", "Plasmablasts", "CD14 Monocytes",
+> "CD16 Monocytes", "DC", "Megakaryocytes", "HSPC", "Doublets".
+> Fill in the vector below (one name per cluster, in cluster order), then
+> compare your annotation with the automatic one in 5.5.
 
-
-```{r, fig.width = 7, fig.height = 5}
-singleR_colors <- c("CD4+ T cells" = "#EA811F",
-                    "CD8+ T cells" = "maroon",
-                    "CD8+ Tcells" = "maroon",
-                    "other T cells"= "peru",
-                    "NK cells" = "#6A3D8A",
-                    "B cells" = "goldenrod1",
-                    'Plasmablasts' = 'goldenrod4',
-                    'Prolif Lymphocytes'='#8fdbaf',
-                    "Megakaryocytes" = "darkolivegreen",
-                    'HPSC'='thistle1',
-                    "DC" = "orchid3",
-                    "CD14 Monocytes" = "paleturquoise3",
-                    "CD16 Monocytes" = "#577676")
-
-DimPlot(object = Object_V3, reduction = 'umap', label = FALSE, group.by ="CellTypes", cols =singleR_colors )
+```{r ex5.1, eval=FALSE}
+levels(obj$seurat_clusters)
+my.cluster.ids <- c("...", "...", "...")   # one entry per cluster
+names(my.cluster.ids) <- levels(obj$seurat_clusters)
+obj$my_CellTypes <- unname(my.cluster.ids[as.character(obj$seurat_clusters)])
+table(obj$my_CellTypes, obj$CellTypes)       # run after 5.5
 ```
 
+## 5.5 Final annotation
 
+So that everybody continues with the same labels, we annotate each cluster
+automatically:
 
-## Transcription analysis
+- With the reference: the most frequent `celltype.l2` label in the cluster,
+  collapsed to the broad cell types above.
+- Without it: the cell type whose canonical markers score highest in the
+  cluster.
 
-# 3.1 Differentiall abundance
+**Instructors: always check this against the DotPlot!** Correct a cluster by
+hand if needed (see the commented line).
 
+```{r final-annotation}
+l2_to_broad <- c(
+  "CD4 Naive" = "CD4+ T cells", "CD4 TCM" = "CD4+ T cells", "CD4 TEM" = "CD4+ T cells",
+  "CD4 CTL" = "CD4+ T cells", "Treg" = "CD4+ T cells",
+  "CD8 Naive" = "CD8+ T cells", "CD8 TCM" = "CD8+ T cells", "CD8 TEM" = "CD8+ T cells",
+  "gdT" = "other T cells", "MAIT" = "other T cells", "dnT" = "other T cells",
+  "CD4 Proliferating" = "Prolif Lymphocytes", "CD8 Proliferating" = "Prolif Lymphocytes",
+  "NK Proliferating" = "Prolif Lymphocytes",
+  "NK" = "NK cells", "NK_CD56bright" = "NK cells", "ILC" = "NK cells",
+  "B naive" = "B cells", "B intermediate" = "B cells", "B memory" = "B cells",
+  "Plasmablast" = "Plasmablasts",
+  "CD14 Mono" = "CD14 Monocytes", "CD16 Mono" = "CD16 Monocytes",
+  "cDC1" = "DC", "cDC2" = "DC", "pDC" = "DC", "ASDC" = "DC",
+  "Platelet" = "Megakaryocytes", "Eryth" = "Erythrocytes", "HSPC" = "HSPC", "Doublet" = "Doublets")
 
+if (has_reference) {
+  obj$broad_ref <- unname(l2_to_broad[obj$celltype.l2])
+  cluster_annotation <- obj@meta.data %>% count(seurat_clusters, broad_ref) %>%
+    group_by(seurat_clusters) %>% mutate(purity = round(100 * n / sum(n), 1)) %>%
+    slice_max(n, n = 1, with_ties = FALSE) %>% select(seurat_clusters, CellType = broad_ref, purity)
+} else {
+  obj <- AddModuleScore(obj, features = canonical_markers, name = "marker_score")
+  score_cols <- paste0("marker_score", seq_along(canonical_markers))
+  mean_scores <- obj@meta.data %>% group_by(seurat_clusters) %>%
+    summarise(across(all_of(score_cols), mean))
+  cluster_annotation <- data.frame(
+    seurat_clusters = mean_scores$seurat_clusters,
+    CellType = names(canonical_markers)[max.col(as.matrix(mean_scores[, score_cols]))])
+}
+cluster_annotation
 
-# 3.2. Differentially expressed genes
-# Covid-19 vs. Healthy or Covid-19 vs. Recovered
-# For a specific cell type
-```{r}
-Object_V3$Celltype.Disease<-paste(Object_V3$CellTypes, Object_V3$Disease, sep = "_")
-table(Object_V3$Celltype.Disease)
-Idents(Object_V3)<-Object_V3$Celltype.Disease
-
-Cluster.response01_Wil<- FindMarkers(Object_V3, ident.1 = 'Megakaryocytes_covid19', ident.2 = 'Megakaryocytes_healthy', test.use = "wilcox", verbose = FALSE)
-Cluster.response01_Wil<-subset(Cluster.response01_Wil, p_val_adj < 0.05)
-wil<-rownames(Cluster.response01_Wil)
-Cluster.response01_MAST<- FindMarkers(Object_V3, ident.1 = 'Megakaryocytes_covid19', ident.2 = 'Megakaryocytes_healthy', test.use='MAST', verbose = FALSE)
-Cluster.response01_MAST<-subset(Cluster.response01_MAST, p_val_adj < 0.05)
-MAST<-rownames(Cluster.response01_MAST)
-Cluster.response01_Bimod<- FindMarkers(Object_V3, ident.1 = 'Megakaryocytes_covid19', ident.2 = 'Megakaryocytes_healthy', test.use='bimod', verbose = FALSE)
-Cluster.response01_Bimod<-subset(Cluster.response01_Bimod, p_val_adj < 0.05)
-Bimod<-rownames(Cluster.response01_Bimod)
-
-a.b <- intersect(wil, MAST)
-b.c <- intersect(MAST, Bimod)
-a.c <- intersect(wil, Bimod)
-a.b.c <- intersect(a.b, Bimod)
+new.cluster.ids <- setNames(cluster_annotation$CellType, cluster_annotation$seurat_clusters)
+# new.cluster.ids["5"] <- "Doublets"      # manual correction example
+obj$CellTypes <- unname(new.cluster.ids[as.character(obj$seurat_clusters)])
+Idents(obj) <- "CellTypes"
+table(obj$CellTypes, obj$sample_id)
 ```
 
-# What are the differences between Cluster.response01_Wil, Cluster.response01_MAST or Cluster.response01_Bimod?
-# How many genes are chared between methods?
+```{r remove-doublets, fig.width=7, fig.height=5}
+obj <- obj[, !obj$CellTypes %in% c("Doublets", "Erythrocytes")]
 
-
-# Find all the differentially expressed genes per cluster
-```{r, fig.width = 4, fig.height=8}
-All_pre.markers <- FindAllMarkers(Object_V3, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
-
-top10 <- All_pre.markers %>% group_by(cluster) %>% top_n(5, avg_log2FC)
-utop10<-unique(top10$gene)
-color<-brewer.pal(n = 9, name = "RdBu")
-
-DotPlot(Object_V3, features=utop10,  dot.scale = 8, assay='RNA') +
-  scale_color_gradientn(colours  = rev(color)) + coord_flip() + 
-  theme( axis.text.x = element_text(angle = 60, hjust = 1))
-
+celltype_colors <- c("CD4+ T cells" = "#EA811F", "CD8+ T cells" = "maroon", "other T cells" = "peru",
+                     "NK cells" = "#6A3D8A", "B cells" = "goldenrod1", "Plasmablasts" = "goldenrod4",
+                     "Prolif Lymphocytes" = "#8fdbaf", "Megakaryocytes" = "darkolivegreen",
+                     "HSPC" = "thistle1", "DC" = "orchid3",
+                     "CD14 Monocytes" = "paleturquoise3", "CD16 Monocytes" = "#577676")
+DimPlot(obj, reduction = "umap", group.by = "CellTypes", cols = celltype_colors, label = TRUE, repel = TRUE)
 ```
 
-##  For enrichment analysis (TopGO or KEEG or..). find the packages compatible for you machine (e.g. TopGO or clusterProfiler). Here is the example for ClusterProfiler
-
-# 3.3.Gene ontology enrichment analysis (clusterProfiler)
-```{r}
-##### Functional enrichment of cluster marker genes
-# defined present genes
-present_genes_entrez <- bitr(rownames(Object_V3@assays$RNA), 
-                             fromType = "SYMBOL", 
-                             toType="ENTREZID", 
-                             OrgDb=org.Hs.eg.db)$ENTREZID
-GOresults.list <- list()
-for(i in unique(All_pre.markers$cluster)){
-  print(i)
-  markers <- All_pre.markers[All_pre.markers$cluster==i,]
-  print(paste("cluster: ",i, ", marker genes: ",paste(markers$gene[1:10],collapse=", "),", ...",sep=""))
-  
-  markers_entrez <- bitr(markers$gene, 
-                         fromType = "SYMBOL", 
-                         toType="ENTREZID", 
-                         OrgDb=org.Hs.eg.db)$ENTREZID
-  
-  
-  # GO enrichment
-  GO <- as.data.frame(enrichGO(gene = markers_entrez,
-                               universe = present_genes_entrez,
-                               OrgDb = org.Hs.eg.db,
-                               ont = "BP",
-                               pAdjustMethod = "bonferroni",
-                               pvalueCutoff  = 0.2,
-                               qvalueCutoff  = 0.2,
-                               readable      = T))
-  
-  if(nrow(GO)>0){GO$cluster <- as.character(i)}
-    if(nrow(GO)>0){GOresults.list[[paste(i)]] <- GO}
-
-}  
-
-#### GO Results
-GOresults <- do.call("rbind", GOresults.list)
-write.csv(GOresults, file='GOResults.csv')
+```{r umap-split, fig.width=12, fig.height=9}
+DimPlot(obj, reduction = "umap", group.by = "CellTypes", cols = celltype_colors,
+        split.by = "sample_id", ncol = 3) + NoLegend()
 ```
 
-# Focus on top 5 terms of particular cell types. Megakaryocytes and Monocytes from covid-19 vs. healthy
-```{r, fig.width = 4, fig.height=6}
-GOresults %>% group_by(cluster) %>% top_n(n= 5, wt = GeneRatio) -> terms
-tmp <- GOresults[GOresults$Description %in% terms$Description,]
-tmp$Description <- ifelse(nchar(tmp$Description)>80,
-                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
-                          tmp$Description)
-tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+> **Exercise 5.2 (preview of Part 2).** Just by looking at the split UMAP,
+> which cell types seem to change in COVID-19? Do any seem to differ between
+> the female and the male samples? Write down your guess; in Part 2 we
+> test it properly.
 
-tmp2<-subset(tmp, tmp$cluster  %in% c('Megakaryocytes_covid19', 'Megakaryocytes_healthy',
-                                      'CD14 Monocytes_covid19', 'CD14 Monocytes_healthy',
-                                      'CD16 Monocytes_covid19', 'CD16 Monocytes_healthy'))
+# 6. Save
 
-ggplot(tmp2, aes(x = cluster, y = Description, color = p.adjust)) +
-  geom_point(aes(size = Count)) +
-  scale_colour_gradientn(colours=c('red', 
-                                   'orange', 
-                                   'darkblue',
-                                   'darkblue'),
-                         limits=c(0,1),
-                         values   = c(0,0.05,0.2,0.5,1),
-                         breaks   = c(0.05,0.2,1),
-                         labels = format(c(0.05,0.2,1))) +
-  ylab(NULL) +
-  theme_bw() + 
-  theme(text = element_text(size=12),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+We save a slim version of the object (counts, normalised data, UMAP and
+metadata). Part 2 starts from this file, so students who could not finish
+Part 1 can use the instructor's copy.
 
+```{r save}
+obj_small <- DietSeurat(obj, assays = "RNA", layers = c("counts", "data"), dimreducs = "umap")
+if ("scale.data" %in% Layers(obj_small)) obj_small[["RNA"]]$scale.data <- NULL
+obj_small@misc$gene_chr <- gene_chr
+saveRDS(obj_small, file = file.path(params$out_dir, "D3_annotated_6samples.rds"))
 ```
 
-```{r}
-Idents(Object_V3)<-Object_V3$seurat_clusters
-new.cluster.ids <- c( "CD14 Monocytes", "CD8+ T cells", "CD4+ T cells", "CD4+ T cells", "NK cells",
-                      "5", "CD16 Monocytes", "NK cells", "B cells", "Megakaryocytes",
-                      "CD8+ T cells", "Prolif Lymphocytes", "CD8+ T cells", "CD14 Monocytes", "other T cells",
-                      "Plasmablasts", "CD8+ T cells", "HPSC", "DC", "CD14 Monocytes",
-                      "other T cells", "CD8+ T cells")
-names(new.cluster.ids) <- levels(Object_V3)
-Object_V3 <- RenameIdents(Object_V3, new.cluster.ids)
-Object_V3$CellTypes<-Idents(Object_V3)
-Object_V3<-subset(Object_V3, idents=c('5') , invert = TRUE)
+```{r session-info}
+sessionInfo()
 ```
-
-

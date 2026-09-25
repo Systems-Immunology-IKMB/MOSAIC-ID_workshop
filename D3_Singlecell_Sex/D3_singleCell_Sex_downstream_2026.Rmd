@@ -1,0 +1,832 @@
+---
+title: "Single-cell transcriptomics with a sex & gender lens"
+subtitle: "Part 2 - sex-sensitive downstream analyses"
+author: "Joana P. Bernardes & Neha Mishra"
+date: "MOSAIC-ID workshop 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_download: true
+params:
+  input_rds: "output/D3_annotated_6samples.rds"  # written at the end of Part 1
+  out_dir: "output"
+  celltype_col: "CellTypes"
+  celltype_of_interest: ""   # empty = choose automatically from the differential abundance results
+  min_cells: 10              # minimum cells per sample for a pseudobulk sample
+  solutions: false           # TRUE renders the instructor version (with solutions)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(33)
+```
+
+# Introduction
+
+In Part 1 we annotated about a dozen cell types in 6 PBMC samples. Now we ask
+biological questions. With a sex lens, "Is there a difference?" splits into
+**three different questions**, and each needs its own statistical model:
+
+| Question | Statistical term | Model |
+|---|---|---|
+| Does COVID-19 change X, on average over both sexes? | main effect of disease (adjusted for sex) | `~ sex + disease` |
+| Do female and male samples differ in X? | main effect of sex (adjusted for disease) | `~ sex + disease` |
+| Is the effect of COVID-19 **different** in females and males? | sex × disease **interaction** | `~ sex * disease` |
+
+Four ideas come back throughout this notebook:
+
+1. **The unit of replication is the individual, not the cell.** 5,000 cells
+   from one woman are still *one* woman. Treating cells as replicates
+   (*pseudoreplication*) gives tiny, misleading p-values.
+2. **Sex-stratified results are useful, but they do not prove a sex
+   difference.** "Significant in females, not significant in males" is not a
+   test of a sex difference (Gelman & Stern, 2006). The interaction test is.
+3. **Sex-chromosome genes** (*XIST*, chrY genes, X-inactivation escapees)
+   always differ between the sexes. They can hide, or fake, other results if the
+   design is unbalanced.
+4. **Power.** With one or two donors per group, a non-significant result
+   tells us very little. We are *exploring* and *learning the methods* here,
+   not making claims about COVID-19 biology.
+
+Outline:
+
+1. Differential abundance (DA): do cell-type proportions change?
+2. Differential expression (DE), per cell vs. pseudobulk, with sex in the model
+3. Enrichment analysis: over-representation (ORA) and gene set enrichment
+   (GSEA), by sex
+
+# 0. Setup
+
+```{r libraries}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(limma)
+library(edgeR)
+library(speckle)       # propeller (differential abundance)
+library(DESeq2)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+
+# Bioconductor packages mask some dplyr verbs (e.g. AnnotationDbi::select, matrixStats::count)
+select <- dplyr::select; count <- dplyr::count; filter <- dplyr::filter
+
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+sex_cols     <- c(female = "#E69F00", male = "#009E73")  # colour-blind safe, avoids pink/blue stereotypes
+disease_cols <- c(healthy = "grey60", COVID19 = "#CC3311")
+theme_set(theme_bw())
+```
+
+# 1. Data and study design
+
+```{r load}
+obj <- readRDS(params$input_rds)
+obj$CellTypes <- as.character(obj[[params$celltype_col, drop = TRUE]])
+obj$disease   <- factor(obj$disease, levels = c("healthy", "COVID19"))  # healthy = reference level
+obj$sex       <- factor(obj$sex,     levels = c("female", "male"))       # female  = reference level
+obj$group     <- factor(paste(obj$sex, obj$disease, sep = "_"),
+                        levels = c("female_healthy", "male_healthy", "female_COVID19", "male_COVID19"))
+Idents(obj) <- "CellTypes"
+obj
+
+# one row per sample
+sample_info <- obj@meta.data %>%
+  distinct(sample_id, donor, disease, sex, group, timepoint) %>%
+  arrange(disease, sex, sample_id)
+rownames(sample_info) <- sample_info$sample_id
+sample_info
+
+# chromosome of each gene (computed in Part 1; recomputed if missing)
+gene_chr <- obj@misc$gene_chr
+if (is.null(gene_chr)) {
+  valid <- intersect(rownames(obj), keys(org.Hs.eg.db, keytype = "SYMBOL"))
+  gene_chr <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = valid, keytype = "SYMBOL", column = "CHR",
+                                    multiVals = function(x) paste(sort(unique(x)), collapse = ";"))
+}
+gene_chr <- setNames(ifelse(is.na(gene_chr[rownames(obj)]), "unknown", gene_chr[rownames(obj)]), rownames(obj))
+chr_class <- function(genes) {
+  ch <- gene_chr[genes]
+  factor(case_when(ch == "X" ~ "chrX", ch %in% c("Y", "X;Y") ~ "chrY / PAR", TRUE ~ "autosomal / other"),
+         levels = c("chrX", "chrY / PAR", "autosomal / other"))
+}
+```
+
+```{r design-table}
+table(sample_info$disease, sample_info$sex)                                    # samples
+table(distinct(sample_info, donor, disease, sex)[, c("disease", "sex")])       # donors
+repeated_donors <- any(duplicated(sample_info$donor))
+repeated_donors
+```
+
+> **Exercise 1 (5 min, pen & paper).**
+>
+> 1. How many biological replicates (donors) are there per sex × disease
+>    group?
+> 2. A linear model with `~ sex + disease` estimates 3 parameters
+>    (intercept, sex, disease). With 6 samples, how many residual degrees of
+>    freedom are left to estimate the variability? And with
+>    `~ sex * disease` (4 parameters)?
+> 3. If both COVID-19 samples of one sex come from the **same person** (two
+>    time points), what is the variability between them actually measuring?
+
+```{asis, echo=params$solutions}
+**Solution.** (2) 6 - 3 = 3 and 6 - 4 = 2 residual degrees of freedom.
+With so few, the variance estimates are very uncertain. limma/DESeq2 borrow
+information across genes or cell types, which helps, but power stays low.
+(3) Two samples from one donor measure *within-person* (time-point and
+technical) variability, not *between-person* variability. Treating them as
+independent donors makes the groups look less variable than they are, and
+the p-values come out too small. We come back to this in 2.4 and 3.6.
+```
+
+# 2. Differential abundance: cell proportions
+
+## 2.1 Look at the data first
+
+```{r proportions}
+ct_counts <- table(sample_id = obj$sample_id, celltype = obj$CellTypes)
+ct_counts
+
+prop_df <- as.data.frame(prop.table(ct_counts, margin = 1), responseName = "proportion") %>%
+  left_join(sample_info, by = "sample_id")
+```
+
+```{r prop-barplot, fig.width=10, fig.height=5}
+ggplot(prop_df, aes(x = sample_id, y = proportion, fill = celltype)) +
+  geom_col() +
+  facet_grid(~ disease + sex, scales = "free_x", space = "free_x") +
+  labs(x = NULL, y = "fraction of cells", title = "Cell-type composition per sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r prop-dotplot, fig.width=12, fig.height=8}
+ggplot(prop_df, aes(x = disease, y = 100 * proportion, colour = sex)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  stat_summary(aes(group = sex), fun = mean, geom = "line", position = position_dodge(width = 0.5)) +
+  facet_wrap(~ celltype, scales = "free_y") +
+  scale_colour_manual(values = sex_cols) +
+  labs(x = NULL, y = "% of PBMCs", title = "Every dot is one sample")
+```
+
+> **Exercise 2.1.** Which cell types look different between COVID-19 and
+> healthy? Is the change in the same direction in female and male samples?
+> Are the lines parallel (no interaction) or not (possible interaction)?
+
+## 2.2 The naive way (do not do this!)
+
+A tempting approach is to pool all cells per group and run a chi-squared test
+per cell type:
+
+```{r naive-da}
+naive <- lapply(colnames(ct_counts), function(ct) {
+  in_ct <- obj$CellTypes == ct
+  data.frame(celltype = ct,
+             p_disease = chisq.test(table(in_ct, obj$disease))$p.value,
+             p_sex     = chisq.test(table(in_ct, obj$sex))$p.value)
+}) %>% bind_rows() %>% mutate(across(starts_with("p_"), ~ signif(.x, 2)))
+naive
+```
+
+> **Exercise 2.2 (discussion).** How many cell types are "significant"?
+> What does the test assume about the cells? Suppose one healthy woman
+> simply has more NK cells than average. Would this test notice that this is
+> about *one person*?
+
+```{asis, echo=params$solutions}
+**Solution.** Almost everything comes out significant because the test treats
+every cell as an independent observation (n = thousands). Cells from the same
+person are not independent. The test ignores the (large) variation *between
+people*, so it tests "are these particular 6 samples different?" instead of
+"are COVID-19 patients different from healthy people?". This is
+**pseudoreplication**.
+```
+
+## 2.3 Sample-level test: propeller
+
+`propeller` (Phipson *et al.*, 2022, *Bioinformatics*):
+
+1. Computes the proportion of each cell type **per sample**.
+2. Transforms the proportions (logit or arcsin-square-root).
+3. Fits a linear model per cell type with limma. Each sample is one
+   observation, so we can include `sex` in the design.
+
+```{r propeller}
+props <- getTransformedProps(clusters = obj$CellTypes, sample = obj$sample_id, transform = "logit")
+si <- sample_info[colnames(props$TransformedProps), ]   # same sample order as the proportions
+# propeller wants a "group means" design (no intercept) plus covariates, and a contrast
+# between two group columns. Both designs below are the same model, ~ disease + sex;
+# they only differ in which variable is written as the group means.
+design_disease <- model.matrix(~ 0 + disease + sex, data = si)
+colnames(design_disease)        # diseasehealthy, diseaseCOVID19, sexmale
+da_disease <- propeller.ttest(props, design = design_disease, contrasts = c(-1, 1, 0),  # COVID19 - healthy
+                              robust = TRUE, trend = FALSE, sort = FALSE)
+
+design_sex <- model.matrix(~ 0 + sex + disease, data = si)
+colnames(design_sex)            # sexfemale, sexmale, diseaseCOVID19
+da_sex <- propeller.ttest(props, design = design_sex, contrasts = c(-1, 1, 0),          # male - female
+                          robust = TRUE, trend = FALSE, sort = FALSE)
+da_disease
+da_sex
+```
+
+```{r da-summary}
+mean_prop <- prop_df %>% group_by(celltype) %>%
+  summarise(pct_healthy = 100 * mean(proportion[disease == "healthy"]),
+            pct_COVID19 = 100 * mean(proportion[disease == "COVID19"]),
+            pct_female  = 100 * mean(proportion[sex == "female"]),
+            pct_male    = 100 * mean(proportion[sex == "male"]),
+            min_cells   = min(ct_counts[, as.character(celltype[1])]))
+
+da <- data.frame(celltype    = rownames(da_disease),
+                 t_disease   = da_disease$Tstatistic, p_disease = da_disease$P.Value, fdr_disease = da_disease$FDR,
+                 t_sex       = da_sex[rownames(da_disease), "Tstatistic"],
+                 p_sex       = da_sex[rownames(da_disease), "P.Value"],
+                 fdr_sex     = da_sex[rownames(da_disease), "FDR"]) %>%
+  left_join(mean_prop, by = "celltype") %>%
+  arrange(pmax(p_disease, p_sex))
+da %>% mutate(across(where(is.double), ~ signif(.x, 3)))
+write.csv(da, file.path(params$out_dir, "DA_propeller_disease_sex.csv"), row.names = FALSE)
+```
+
+> **Exercise 2.3.** Compare the propeller p-values with the naive ones.
+> Which cell types stay significant? Why are the p-values so much larger?
+> A positive `t_sex` means higher in male samples, a positive `t_disease`
+> higher in COVID-19. Which cell types differ by sex?
+
+## 2.4 Going further (optional)
+
+> **Exercise 2.4 (interaction).** Fit `~ sex * disease` and test the
+> interaction coefficient (`sexmale:diseaseCOVID19`). Is the COVID-19 effect
+> on any cell type different between the sexes? How many residual degrees of
+> freedom does this model have?
+
+```{r ex2.4-solution, eval=params$solutions, include=params$solutions}
+# ~ sex * disease has the same fit as one mean per sex x disease group
+design_int <- model.matrix(~ 0 + group, data = si)
+colnames(design_int)   # female_healthy, male_healthy, female_COVID19, male_COVID19
+# (female_COVID19 - female_healthy) - (male_COVID19 - male_healthy)
+da_int <- propeller.ttest(props, design = design_int, contrasts = c(-1, 1, 1, -1),
+                          robust = TRUE, trend = FALSE, sort = TRUE)
+da_int
+# The same test with limma and the classical interaction coding:
+fit_int <- eBayes(lmFit(props$TransformedProps, model.matrix(~ sex * disease, data = si)), robust = TRUE)
+topTable(fit_int, coef = "sexmale:diseaseCOVID19", sort.by = "P")
+# residual df = 6 samples - 4 coefficients = 2 -> very little power: absence of evidence != evidence of absence
+```
+
+> **Exercise 2.5 (repeated donors).** If some donors contributed two
+> samples, they are not independent. limma can model this with
+> `duplicateCorrelation()` and a `block` (the donor). Try it on
+> `props$TransformedProps`. What happens to the p-values?
+
+```{r ex2.5-solution, eval=params$solutions && repeated_donors, include=params$solutions && repeated_donors}
+design_add <- model.matrix(~ sex + disease, data = si)
+dc  <- duplicateCorrelation(props$TransformedProps, design_add, block = si$donor)
+dc$consensus.correlation   # correlation between samples of the same donor
+fit <- lmFit(props$TransformedProps, design_add, block = si$donor, correlation = dc$consensus.correlation)
+fit <- eBayes(fit, robust = TRUE)
+topTable(fit, coef = "diseaseCOVID19", sort.by = "P")
+topTable(fit, coef = "sexmale",        sort.by = "P")
+# With only 4 donors this correlation is itself very uncertain - another reason to sample more individuals.
+```
+
+Other DA methods you may meet: `sccomp` (Bayesian compositional model),
+`scCODA` (Python), and neighbourhood-based methods such as `miloR`, which
+do not need clusters.
+
+## 2.5 Choose the cell type for the downstream analyses
+
+We look for a cell type that changes with **disease** and differs by
+**sex**, and that has at least `min_cells` cells in **every** sample (needed
+for pseudobulk). Rule, from strict to lenient:
+
+1. FDR < 0.05 for both disease and sex
+2. otherwise nominal p < 0.05 for both
+3. otherwise the cell type with the smallest max(p_disease, p_sex)
+
+Instructors can override the choice with `params$celltype_of_interest`.
+
+```{r choose-celltype}
+candidates <- da %>% filter(min_cells >= params$min_cells)
+rule <- if (any(candidates$fdr_disease < 0.05 & candidates$fdr_sex < 0.05)) {
+  candidates <- filter(candidates, fdr_disease < 0.05 & fdr_sex < 0.05); "FDR < 0.05 for disease and sex"
+} else if (any(candidates$p_disease < 0.05 & candidates$p_sex < 0.05)) {
+  candidates <- filter(candidates, p_disease < 0.05 & p_sex < 0.05);   "nominal p < 0.05 for disease and sex"
+} else "no cell type passes p < 0.05 for both - taking the smallest max(p) (exploratory!)"
+
+coi <- if (nzchar(params$celltype_of_interest)) params$celltype_of_interest else
+  candidates$celltype[which.min(pmax(candidates$p_disease, candidates$p_sex))]
+if (nzchar(params$celltype_of_interest)) rule <- "set by the instructor (params$celltype_of_interest)"
+stopifnot(coi %in% obj$CellTypes)
+
+cat("Cell type of interest:", coi, "\nSelection rule:", rule, "\n")
+da %>% filter(celltype == coi)
+```
+
+```{r coi-plot, fig.width=5, fig.height=4}
+ggplot(filter(prop_df, celltype == coi), aes(x = disease, y = 100 * proportion, colour = sex)) +
+  geom_point(size = 4, position = position_dodge(width = 0.4)) +
+  scale_colour_manual(values = sex_cols) +
+  labs(x = NULL, y = paste("%", coi, "of PBMCs"), title = coi)
+```
+
+# 3. Differential expression in the cell type of interest
+
+```{r subset}
+sub <- obj[, obj$CellTypes == coi]
+table(sub$sample_id, sub$group)
+```
+
+## 3.1 Per-cell DE (as in many papers - and in our 2022 course)
+
+`FindMarkers()` compares **cells**: every cell is treated as a replicate.
+
+```{r cell-level-de}
+de_cell_disease <- FindMarkers(sub, group.by = "disease", ident.1 = "COVID19", ident.2 = "healthy",
+                               test.use = "wilcox", logfc.threshold = 0.1, verbose = FALSE)
+sum(de_cell_disease$p_val_adj < 0.05)   # number of "significant" genes
+head(de_cell_disease, 10)
+```
+
+> **Exercise 3.1 (method comparison, from the 2022 course).** Repeat the
+> test with `test.use = "bimod"` (and `"MAST"`, if installed). How many
+> genes are significant with each method, and how many are shared?
+
+```{r ex3.1-solution, eval=params$solutions, include=params$solutions}
+de_bimod <- FindMarkers(sub, group.by = "disease", ident.1 = "COVID19", ident.2 = "healthy",
+                        test.use = "bimod", logfc.threshold = 0.1, verbose = FALSE)
+wil   <- rownames(de_cell_disease)[de_cell_disease$p_val_adj < 0.05]
+bimod <- rownames(de_bimod)[de_bimod$p_val_adj < 0.05]
+c(wilcox = length(wil), bimod = length(bimod), shared = length(intersect(wil, bimod)))
+if (requireNamespace("MAST", quietly = TRUE)) {
+  de_mast <- FindMarkers(sub, group.by = "disease", ident.1 = "COVID19", ident.2 = "healthy",
+                         test.use = "MAST", logfc.threshold = 0.1, verbose = FALSE)
+  mast <- rownames(de_mast)[de_mast$p_val_adj < 0.05]
+  c(MAST = length(mast), shared_all = length(Reduce(intersect, list(wil, bimod, mast))))
+}
+```
+
+## 3.2 Sex differences per cell: meet the sex-chromosome genes
+
+```{r cell-level-sex, fig.width=7, fig.height=5}
+de_cell_sex <- FindMarkers(sub, group.by = "sex", ident.1 = "male", ident.2 = "female",
+                           test.use = "wilcox", logfc.threshold = 0.1, verbose = FALSE)
+de_cell_sex$gene <- rownames(de_cell_sex)
+de_cell_sex$chr  <- chr_class(de_cell_sex$gene)
+
+top_sex <- de_cell_sex %>% filter(p_val_adj < 0.05) %>% slice_max(abs(avg_log2FC), n = 15)
+ggplot(de_cell_sex, aes(avg_log2FC, -log10(p_val_adj + 1e-300), colour = chr)) +
+  geom_point(size = 1) +
+  geom_text_repel(data = top_sex, aes(label = gene), size = 3, max.overlaps = 30, show.legend = FALSE) +
+  scale_colour_manual(values = c("chrX" = "#E69F00", "chrY / PAR" = "#009E73", "autosomal / other" = "grey70")) +
+  labs(x = "log2FC (male vs female)", y = "-log10 adj. p", title = paste(coi, "- male vs female, per cell"))
+
+de_cell_sex %>% filter(p_val_adj < 0.05) %>% count(chr) %>% mutate(pct = round(100 * n / sum(n), 1))
+```
+
+> **Exercise 3.2.**
+>
+> 1. What are the strongest sex-associated genes? On which chromosomes are
+>    they?
+> 2. Many chrY genes have an X-linked partner (a *gametolog*): *DDX3X/DDX3Y*,
+>    *KDM5C/KDM5D*, *KDM6A/UTY*, *EIF1AX/EIF1AY*, *ZFX/ZFY*, *RPS4X/RPS4Y1*.
+>    Look them up in `de_cell_sex`. Why could the X copy be higher in
+>    females? (Hint: X-inactivation escape; Tukiainen *et al.*, 2017,
+>    *Nature*.)
+> 3. Now repeat the male vs female test using **only the two healthy
+>    samples** (one woman, one man). How many genes are "significant"? Would
+>    you publish these as "sex differences in `r coi`"?
+
+```{r ex3.2-solution, eval=params$solutions, include=params$solutions}
+gametologs <- c("DDX3X", "DDX3Y", "KDM5C", "KDM5D", "KDM6A", "UTY", "EIF1AX", "EIF1AY", "ZFX", "ZFY", "RPS4X", "RPS4Y1")
+de_cell_sex[intersect(gametologs, rownames(de_cell_sex)), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "chr")]
+
+sub_hc <- sub[, sub$disease == "healthy"]
+de_hc_sex <- FindMarkers(sub_hc, group.by = "sex", ident.1 = "male", ident.2 = "female",
+                         logfc.threshold = 0.1, verbose = FALSE)
+sum(de_hc_sex$p_val_adj < 0.05)
+# Many "significant" genes from n = 1 vs n = 1! These are differences between two PEOPLE
+# (genetics, age, time of sampling, processing batch...), not between the sexes.
+```
+
+## 3.3 Pseudobulk: one expression profile per sample
+
+We **sum the raw counts of all cells of the cell type in each sample**. Each
+sample then becomes one "bulk RNA-seq" library, and we can use the bulk tools
+from Day 2 (DESeq2, edgeR, limma). They treat samples, not cells, as
+replicates, and let us put sex and disease in the design.
+
+```{r pseudobulk}
+pseudobulk <- function(o, by) {
+  f  <- factor(o[[by, drop = TRUE]])
+  mm <- Matrix::sparse.model.matrix(~ 0 + f)
+  colnames(mm) <- levels(f)
+  as.matrix(LayerData(o, assay = "RNA", layer = "counts") %*% mm)
+}
+# (Seurat's AggregateExpression(sub, group.by = "sample_id") does the same.)
+
+pb <- pseudobulk(sub, "sample_id")
+n_cells <- table(sub$sample_id)[colnames(pb)]
+n_cells
+keep_samples <- names(n_cells)[n_cells >= params$min_cells]
+pb <- pb[, keep_samples]
+coldata <- sample_info[colnames(pb), ]
+coldata$n_cells <- as.vector(n_cells[colnames(pb)])
+
+keep_genes <- filterByExpr(pb, group = coldata$group)
+pb <- pb[keep_genes, ]
+dim(pb)
+```
+
+```{r pb-pca, fig.width=11, fig.height=4.5}
+dds <- DESeqDataSetFromMatrix(pb, colData = coldata, design = ~ sex + disease)
+vsd <- vst(dds, blind = TRUE, nsub = min(1000, nrow(dds)))
+plotPCA(vsd, intgroup = "disease") + ggtitle("PCA - disease") +
+plotPCA(vsd, intgroup = "sex") + scale_colour_manual(values = sex_cols) + ggtitle("PCA - sex")
+```
+
+> **Exercise 3.3.** What separates the samples on PC1 and on PC2? Which
+> genes load most on these PCs (`prcomp(t(assay(vsd)[top_var_genes, ]))`)?
+> Are sex-chromosome genes among them?
+
+```{r ex3.3-solution, eval=params$solutions, include=params$solutions}
+top_var <- head(order(matrixStats::rowVars(assay(vsd)), decreasing = TRUE), 500)
+pca <- prcomp(t(assay(vsd)[top_var, ]))
+for (pc in c("PC1", "PC2")) {
+  l <- sort(abs(pca$rotation[, pc]), decreasing = TRUE)[1:15]
+  print(data.frame(gene = names(l), loading = round(l, 3), chr = chr_class(names(l)), row.names = NULL))
+}
+```
+
+## 3.4 Model A: COVID-19 effect adjusted for sex, and sex effect adjusted for disease
+
+```{r deseq-additive}
+dds <- DESeq(dds, quiet = TRUE)
+resultsNames(dds)
+
+tidy_res <- function(res) {
+  as.data.frame(res) %>% mutate(gene = rownames(res), chr = chr_class(rownames(res))) %>% arrange(pvalue)
+}
+res_disease <- tidy_res(results(dds, name = "disease_COVID19_vs_healthy"))
+res_sex     <- tidy_res(results(dds, name = "sex_male_vs_female"))
+
+n_sig <- function(r, alpha = 0.05) sum(r$padj < alpha, na.rm = TRUE)
+c(disease_adj_for_sex = n_sig(res_disease), sex_adj_for_disease = n_sig(res_sex),
+  cell_level_disease = sum(de_cell_disease$p_val_adj < 0.05))
+
+head(res_disease, 10)
+res_sex %>% filter(padj < 0.05) %>% count(chr)
+```
+
+```{r volcano, fig.width=12, fig.height=5}
+volcano <- function(r, title, n_label = 12) {
+  lab <- r %>% filter(padj < 0.05) %>% slice_min(pvalue, n = n_label)
+  ggplot(r, aes(log2FoldChange, -log10(pvalue), colour = padj < 0.05 & !is.na(padj))) +
+    geom_point(size = 0.8) +
+    geom_text_repel(data = lab, aes(label = gene), size = 3, colour = "black", max.overlaps = 30) +
+    scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#CC3311"), name = "padj < 0.05") +
+    ggtitle(title)
+}
+volcano(res_disease, paste(coi, "- COVID-19 vs healthy (adjusted for sex)")) +
+volcano(res_sex,     paste(coi, "- male vs female (adjusted for disease)"))
+```
+
+> **Exercise 3.4.** Compare the number of DE genes between the per-cell
+> test (3.1) and pseudobulk (3.4). Why is the per-cell number so much
+> larger? Which do you trust more? (Squair *et al.*, 2021, *Nat Commun*;
+> Zimmerman *et al.*, 2021, *Nat Commun*.)
+
+```{r ex3.4-solution, eval=params$solutions, include=params$solutions}
+cell_sig <- rownames(de_cell_disease)[de_cell_disease$p_val_adj < 0.05]
+pb_sig   <- res_disease$gene[which(res_disease$padj < 0.05)]
+c(cell_level = length(cell_sig), pseudobulk = length(pb_sig), shared = length(intersect(cell_sig, pb_sig)))
+```
+
+## 3.5 What happens if we forget about sex? A confounding experiment
+
+Our design is balanced: both disease groups have 50% female samples. Many
+real cohorts are not balanced. Imagine a study where all recruited
+COVID-19 patients happened to be women and the healthy volunteer was a man.
+We can mimic this by keeping only the **female COVID-19** samples and the
+**male healthy** sample, and comparing COVID-19 vs healthy.
+
+```{r confounding, fig.width=6, fig.height=5}
+cd_conf <- coldata[(coldata$disease == "COVID19" & coldata$sex == "female") |
+                   (coldata$disease == "healthy" & coldata$sex == "male"), ]
+table(cd_conf$disease, cd_conf$sex)
+
+dds_conf <- DESeq(DESeqDataSetFromMatrix(pb[, rownames(cd_conf)], cd_conf, design = ~ disease), quiet = TRUE)
+res_conf <- tidy_res(results(dds_conf, name = "disease_COVID19_vs_healthy"))
+head(res_conf[, c("gene", "chr", "log2FoldChange", "padj")], 15)
+res_conf %>% filter(padj < 0.05) %>% count(chr) %>% mutate(pct = round(100 * n / sum(n), 1))
+volcano(res_conf, "'COVID-19' vs healthy: female patients vs a male control")
+```
+
+> **Exercise 3.5.**
+>
+> 1. Which of the top "COVID-19 genes" are on the sex chromosomes? Compare
+>    with `res_disease` (balanced design, adjusted for sex) from 3.4.
+> 2. Can we fix this by adding `sex` to the design (`~ sex + disease`)?
+>    Try it and read the error message.
+> 3. Now keep the healthy female as well (COVID-19: 2 female; healthy: 1
+>    female + 1 male) and fit `~ sex + disease`. What can the model estimate
+>    now, and what is it still missing?
+> 4. What does this mean for designing a study, and for reading published
+>    ones?
+
+```{r ex3.5-solution, eval=params$solutions, include=params$solutions}
+# (2) sex and disease are perfectly confounded: the design matrix is not of full rank
+tryCatch(DESeqDataSetFromMatrix(pb[, rownames(cd_conf)], cd_conf, design = ~ sex + disease),
+         error = function(e) cat("Error:", conditionMessage(e), "\n"))
+
+# (3) partial confounding: with a healthy woman the sex effect can be estimated (from the healthy donors only)
+cd_part <- coldata[coldata$sex == "female" | coldata$disease == "healthy", ]
+table(cd_part$disease, cd_part$sex)
+res_part <- tidy_res(results(DESeq(DESeqDataSetFromMatrix(pb[, rownames(cd_part)], cd_part,
+                                                          design = ~ sex + disease), quiet = TRUE),
+                             name = "disease_COVID19_vs_healthy"))
+head(res_part[, c("gene", "chr", "log2FoldChange", "padj")], 15)
+# The model now assumes that the sex difference is the same in COVID-19 and healthy people (no interaction),
+# and it can never check this, because there are no male patients.
+# (4) Balance sex across groups at the DESIGN stage; always report the sex distribution per group; be
+# suspicious of "disease genes" such as XIST, RPS4Y1 or DDX3Y.
+```
+
+## 3.6 Model B: sex-stratified effects and the interaction
+
+We now give each sex × disease group its own mean (`~ 0 + group`). From these
+means we build contrasts:
+
+- **female:** female_COVID19 − female_healthy
+- **male:** male_COVID19 − male_healthy
+- **interaction:** (female effect) − (male effect)
+
+```{r deseq-groups}
+dds_g <- DESeqDataSetFromMatrix(pb, colData = coldata, design = ~ 0 + group)
+dds_g <- DESeq(dds_g, quiet = TRUE)
+resultsNames(dds_g)
+
+contrast_vec <- function(plus, minus) {
+  v <- setNames(rep(0, length(resultsNames(dds_g))), resultsNames(dds_g))
+  v[paste0("group", plus)] <- 1
+  v[paste0("group", minus)] <- -1
+  v
+}
+res_F   <- tidy_res(results(dds_g, contrast = contrast_vec("female_COVID19", "female_healthy")))
+res_M   <- tidy_res(results(dds_g, contrast = contrast_vec("male_COVID19",   "male_healthy")))
+res_int <- tidy_res(results(dds_g, contrast = contrast_vec(c("female_COVID19", "male_healthy"),
+                                                           c("female_healthy", "male_COVID19"))))
+c(female = n_sig(res_F), male = n_sig(res_M), interaction = n_sig(res_int))
+
+write.csv(res_F,   file.path(params$out_dir, paste0("DE_pseudobulk_", make.names(coi), "_female_COVIDvsHC.csv")), row.names = FALSE)
+write.csv(res_M,   file.path(params$out_dir, paste0("DE_pseudobulk_", make.names(coi), "_male_COVIDvsHC.csv")),   row.names = FALSE)
+write.csv(res_int, file.path(params$out_dir, paste0("DE_pseudobulk_", make.names(coi), "_interaction.csv")),      row.names = FALSE)
+```
+
+```{r fc-scatter, fig.width=7, fig.height=6}
+cmp <- inner_join(select(res_F, gene, lfc_F = log2FoldChange, padj_F = padj),
+                  select(res_M, gene, lfc_M = log2FoldChange, padj_M = padj), by = "gene") %>%
+  left_join(select(res_int, gene, padj_int = padj), by = "gene") %>%
+  mutate(across(starts_with("padj"), ~ replace_na(.x, 1)),
+         category = case_when(padj_int < 0.05               ~ "interaction (sex-dependent)",
+                              padj_F < 0.05 & padj_M < 0.05 ~ "both sexes",
+                              padj_F < 0.05                 ~ "females only",
+                              padj_M < 0.05                 ~ "males only",
+                              TRUE                          ~ "not significant"))
+table(cmp$category)
+
+ggplot(cmp, aes(lfc_F, lfc_M, colour = category)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(data = filter(cmp, category == "not significant"), size = 0.6) +
+  geom_point(data = filter(cmp, category != "not significant"), size = 1.5) +
+  geom_text_repel(data = cmp %>% filter(category != "not significant") %>% slice_min(pmin(padj_F, padj_M, padj_int), n = 15),
+                  aes(label = gene), size = 3, show.legend = FALSE, max.overlaps = 30) +
+  scale_colour_manual(values = c("both sexes" = "#CC3311", "females only" = "#E69F00", "males only" = "#009E73",
+                                 "interaction (sex-dependent)" = "#332288", "not significant" = "grey80")) +
+  labs(x = "log2FC COVID-19 vs healthy - females", y = "log2FC COVID-19 vs healthy - males",
+       title = paste(coi, "- COVID-19 response by sex"))
+```
+
+> **Exercise 3.6 (key exercise).**
+>
+> 1. Pick a gene that is significant in "females only". Look up its
+>    log2FC in males. Is it close to zero, or just not significant?
+> 2. How many genes have a significant **interaction**? Compare with the
+>    number of "females only" + "males only" genes. Which number would you
+>    report as "sex-specific COVID-19 genes"?
+> 3. Plot the expression of your gene per sample (e.g. `counts(dds_g,
+>    normalized = TRUE)`), coloured by sex. What do you conclude?
+
+```{r ex3.6-solution, eval=params$solutions, include=params$solutions, fig.width=5, fig.height=4}
+f_only <- cmp %>% filter(category == "females only") %>% arrange(padj_F)
+head(f_only, 10)
+gene <- if (nrow(f_only) > 0) f_only$gene[1] else cmp$gene[which.min(cmp$padj_F)]
+data.frame(norm_count = counts(dds_g, normalized = TRUE)[gene, ], coldata) %>%
+  ggplot(aes(disease, norm_count, colour = sex)) +
+  geom_point(size = 4, position = position_dodge(width = 0.4)) +
+  scale_colour_manual(values = sex_cols) + ggtitle(gene)
+# Most "females only" genes change in the same direction in males but miss the cut-off (dots near the
+# diagonal in the scatter plot). Only the interaction test asks whether the effects DIFFER. Report that
+# number - and keep in mind that with 2 residual df the interaction test has very little power.
+```
+
+```{r ex3.6-donor, eval=params$solutions && repeated_donors, include=params$solutions && repeated_donors}
+# Advanced: repeated samples per donor -> limma-voom with the donor as a block
+y <- calcNormFactors(DGEList(pb))
+design_g <- model.matrix(~ 0 + group, data = coldata)
+colnames(design_g) <- levels(coldata$group)
+v   <- voom(y, design_g)
+dc  <- duplicateCorrelation(v, design_g, block = coldata$donor)
+v   <- voom(y, design_g, block = coldata$donor, correlation = dc$consensus.correlation)
+fit <- lmFit(v, design_g, block = coldata$donor, correlation = dc$consensus.correlation)
+cm  <- makeContrasts(female = female_COVID19 - female_healthy, male = male_COVID19 - male_healthy,
+                     interaction = (female_COVID19 - female_healthy) - (male_COVID19 - male_healthy),
+                     levels = design_g)
+fit2 <- eBayes(contrasts.fit(fit, cm), robust = TRUE)
+dc$consensus.correlation
+summary(decideTests(fit2))
+# Compare with DESeq2. (variancePartition::dream from Day 2 fits the donor as a proper random effect.)
+```
+
+# 4. Enrichment analysis
+
+Next we ask which biological processes are behind the DE genes, **separately
+for each sex**. There are two approaches:
+
+- **Over-representation analysis (ORA):** are GO terms over-represented
+  among the significant genes? Needs a cut-off, and the background
+  (*universe*) should be the genes we tested, not the whole genome.
+- **Gene set enrichment analysis (GSEA):** uses all genes ranked by their
+  test statistic, with no cut-off. Better when power is low, as here.
+
+## 4.1 ORA: GO Biological Process, compared between the sexes
+
+```{r ora}
+universe <- rownames(dds_g)   # the genes we actually tested
+
+gene_lists <- function(alpha) list(
+  female_up   = res_F$gene[which(res_F$padj < alpha & res_F$log2FoldChange > 0)],
+  female_down = res_F$gene[which(res_F$padj < alpha & res_F$log2FoldChange < 0)],
+  male_up     = res_M$gene[which(res_M$padj < alpha & res_M$log2FoldChange > 0)],
+  male_down   = res_M$gene[which(res_M$padj < alpha & res_M$log2FoldChange < 0)])
+
+ora_lists <- Filter(function(g) length(g) >= 10, gene_lists(0.05))
+if (length(ora_lists) == 0) {           # low power: fall back to a lenient, exploratory cut-off
+  message("Fewer than 10 DE genes per list at padj < 0.05 - using padj < 0.2 (exploratory!)")
+  ora_lists <- Filter(function(g) length(g) >= 10, gene_lists(0.2))
+}
+sapply(ora_lists, length)
+
+ora <- NULL
+if (length(ora_lists) > 0) {
+  ora <- compareCluster(geneClusters = ora_lists, fun = "enrichGO",
+                        OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                        universe = universe, pAdjustMethod = "BH",
+                        pvalueCutoff = 0.05, qvalueCutoff = 0.2, minGSSize = 10, maxGSSize = 500)
+}
+if (!is.null(ora) && nrow(as.data.frame(ora)) > 0) {
+  write.csv(as.data.frame(ora), file.path(params$out_dir, paste0("GO_ORA_", make.names(coi), "_by_sex.csv")), row.names = FALSE)
+  head(as.data.frame(ora))
+} else message("No enriched GO terms")
+```
+
+```{r ora-plot, fig.width=9, fig.height=7, eval=!is.null(ora) && nrow(as.data.frame(ora)) > 0}
+dotplot(ora, showCategory = 6) + ggtitle(paste(coi, "- GO BP (ORA), COVID-19 vs healthy by sex"))
+```
+
+> **Exercise 4.1.**
+>
+> 1. Which processes are enriched among the genes up-regulated in COVID-19?
+>    Are they shared between the sexes?
+> 2. Re-run `enrichGO` for `female_up` without the `universe` argument. How
+>    do the results change, and why is the choice of universe important?
+> 3. The female and male lists have different lengths. How can list size
+>    alone create "sex-specific" terms?
+
+```{r ex4.1-solution, eval=params$solutions && length(ora_lists) > 0, include=params$solutions && length(ora_lists) > 0}
+ego_nouniv <- enrichGO(ora_lists[[1]], OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                       pAdjustMethod = "BH", pvalueCutoff = 0.05)
+ego_univ   <- enrichGO(ora_lists[[1]], OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                       universe = universe, pAdjustMethod = "BH", pvalueCutoff = 0.05)
+c(without_universe = nrow(as.data.frame(ego_nouniv)), with_universe = nrow(as.data.frame(ego_univ)))
+# Without a universe, the background is every annotated gene in the genome, including genes that are not
+# expressed in this cell type. Any list of immune-cell genes then looks "enriched" for immune processes.
+```
+
+## 4.2 GSEA: ranked genes, no cut-off
+
+```{r gsea}
+ranked <- list(female = sort(setNames(res_F$stat, res_F$gene), decreasing = TRUE),
+               male   = sort(setNames(res_M$stat, res_M$gene), decreasing = TRUE))
+ranked <- lapply(ranked, function(r) r[!is.na(r)])
+
+gsea <- compareCluster(geneClusters = ranked, fun = "gseGO",
+                       OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                       minGSSize = 15, maxGSSize = 500, pvalueCutoff = 0.05, eps = 0, seed = TRUE)
+gsea_df <- if (is.null(gsea)) data.frame() else as.data.frame(gsea)
+nrow(gsea_df)
+if (nrow(gsea_df) > 0) write.csv(gsea_df, file.path(params$out_dir, paste0("GO_GSEA_", make.names(coi), "_by_sex.csv")), row.names = FALSE)
+```
+
+```{r gsea-plot, fig.width=10, fig.height=8, eval=nrow(gsea_df) > 0}
+dotplot(gsea, showCategory = 8, split = ".sign") + facet_grid(. ~ .sign) +
+  ggtitle(paste(coi, "- GSEA GO BP, COVID-19 vs healthy by sex"))
+```
+
+```{r nes-compare, fig.width=7, fig.height=6, eval=nrow(gsea_df) > 0}
+nes <- gsea_df %>% select(Cluster, ID, Description, NES, p.adjust) %>%
+  pivot_wider(names_from = Cluster, values_from = c(NES, p.adjust))
+ggplot(nes, aes(NES_female, NES_male)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(linetype = "dashed", colour = "grey50") + geom_point() +
+  geom_text_repel(data = slice_max(nes, abs(coalesce(NES_female, 0)) + abs(coalesce(NES_male, 0)), n = 12),
+                  aes(label = substr(Description, 1, 40)), size = 2.8) +
+  labs(title = "GO terms significant in at least one sex", x = "NES females", y = "NES males")
+```
+
+> **Exercise 4.2.**
+>
+> 1. Do ORA and GSEA agree?
+> 2. Is the interferon response (e.g. "response to virus", "type I
+>    interferon signaling pathway") enriched in both sexes? Is it stronger in
+>    one of them? (Compare with Takahashi *et al.*, 2020.)
+> 3. A GO term missing from the male results (`NA` above) is not
+>    necessarily "absent in males". How could you check this properly?
+>    (Hint: `gseaplot2()`, or run GSEA on the interaction statistic
+>    `res_int$stat`.)
+
+```{r ex4.2-solution, eval=params$solutions, include=params$solutions, fig.width=9, fig.height=6}
+ranked_int <- sort(setNames(res_int$stat, res_int$gene), decreasing = TRUE)
+gsea_int <- gseGO(ranked_int[!is.na(ranked_int)], OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                  minGSSize = 15, maxGSSize = 500, pvalueCutoff = 0.05, eps = 0, seed = TRUE)
+head(as.data.frame(gsea_int)[, c("Description", "NES", "p.adjust")], 15)
+# positive NES = more up-regulated by COVID-19 in females than in males
+if (nrow(as.data.frame(gsea_int)) > 0) dotplot(gsea_int, showCategory = 10, split = ".sign") + facet_grid(. ~ .sign)
+```
+
+> **Exercise 4.3 (chromosomes).** Are the genes that differ by sex
+> (`res_sex`, padj < 0.05) over-represented on the X chromosome? Use a
+> Fisher test on a 2×2 table (DE yes/no × chrX yes/no), with all tested genes
+> as background.
+
+```{r ex4.3-solution, eval=params$solutions, include=params$solutions}
+tab <- table(DE = res_sex$padj < 0.05 & !is.na(res_sex$padj), chrX = res_sex$chr == "chrX")
+tab
+fisher.test(tab)
+```
+
+# 5. Wrap-up
+
+## What did we find?
+
+```{r summary-table}
+data.frame(
+  analysis = c("DA: cell type chosen", "DA: selection rule",
+               "DE per cell, COVID vs healthy", "DE pseudobulk, COVID vs healthy (adj. sex)",
+               "DE pseudobulk, male vs female (adj. disease)",
+               "DE pseudobulk, females: COVID vs healthy", "DE pseudobulk, males: COVID vs healthy",
+               "DE pseudobulk, sex x disease interaction"),
+  result = c(coi, rule, sum(de_cell_disease$p_val_adj < 0.05), n_sig(res_disease), n_sig(res_sex),
+             n_sig(res_F), n_sig(res_M), n_sig(res_int)))
+```
+
+## A checklist for sex-sensitive single-cell studies (after SAGER)
+
+- [ ] Report the number of **individuals** (not just cells or samples) per sex and group.
+- [ ] Report how sex was determined (self-report, clinical record, genetics) and check it in the data (*XIST*/chrY).
+- [ ] Use the correct terms: sex vs gender. If gender is relevant, collect it separately.
+- [ ] Balance sex across the groups at the design stage, or at least model it.
+- [ ] Treat individuals as the replicates (pseudobulk, mixed models), not cells.
+- [ ] Test sex differences with an **interaction** term, not by comparing stratified p-values.
+- [ ] Report sex-disaggregated results, even when not significant, so that future meta-analyses can use them.
+- [ ] Discuss power: "no significant sex difference" ≠ "no sex difference".
+- [ ] Watch out for sex-chromosome genes (and for loss of Y in older male donors).
+
+## Final discussion
+
+> Based on today's analysis, write two sentences you could put in the
+> *Results* section of a paper about `r coi` in COVID-19, and one sentence
+> for the *Limitations*.
+
+## Further reading
+
+- Phipson B *et al.* (2022) propeller: testing for differences in cell type proportions in single cell data. *Bioinformatics*.
+- Squair JW *et al.* (2021) Confronting false discoveries in single-cell differential expression. *Nat Commun*.
+- Zimmerman KD, Espeland MA, Langefeld CD (2021) A practical solution to pseudoreplication bias in single-cell studies. *Nat Commun*.
+- Crowell HL *et al.* (2020) muscat detects subpopulation-specific state transitions from multi-sample multi-condition single-cell transcriptomics data. *Nat Commun*.
+- Gelman A, Stern H (2006) The difference between "significant" and "not significant" is not itself statistically significant. *Am Stat*.
+- Heidari S *et al.* (2016) Sex and Gender Equity in Research: rationale for the SAGER guidelines. *Res Integr Peer Rev*.
+- Klein SL, Flanagan KL (2016) Sex differences in immune responses. *Nat Rev Immunol*.
+- Takahashi T *et al.* (2020) Sex differences in immune responses that underlie COVID-19 disease outcomes. *Nature*.
+- Tukiainen T *et al.* (2017) Landscape of X chromosome inactivation across human tissues. *Nature*.
+
+```{r session-info}
+sessionInfo()
+```
