@@ -181,14 +181,13 @@ read_sample <- function(folder) {
   if (is.list(counts)) counts <- counts[["Gene Expression"]]  # CITE-seq / multiome output
   counts
 }
-n_raw_barcodes <- c()
 
 seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
   counts <- read_sample(samples$folder[i])
-  n_raw_barcodes[samples$sample_id[i]] <<- ncol(counts)
   obj <- CreateSeuratObject(counts = counts,
                             project = samples$sample_id[i],
                             min.cells = 3, min.features = 200)
+  obj@misc$n_raw_barcodes <- ncol(counts)
   # add the sample-level metadata to every cell
   for (col in c("sample_id", "donor", "disease", "sex", "timepoint")) obj[[col]] <- samples[i, col]
   obj
@@ -196,7 +195,7 @@ seurat_list <- lapply(seq_len(nrow(samples)), function(i) {
 names(seurat_list) <- samples$sample_id
 names(seurat_list)   # the objects are now called by their sample_id, e.g. seurat_list$HC_M
 
-data.frame(raw_barcodes = n_raw_barcodes[names(seurat_list)],
+data.frame(raw_barcodes       = sapply(seurat_list, function(o) o@misc$n_raw_barcodes),
            after_min_features = sapply(seurat_list, ncol))  # barcodes kept per sample
 ```
 

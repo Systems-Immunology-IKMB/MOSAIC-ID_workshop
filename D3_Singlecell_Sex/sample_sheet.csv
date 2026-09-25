@@ -1,7 +1,7 @@
 sample_id,folder,donor,disease,sex,timepoint,notes
-COV_F_T1,FILL_ME,COV_F,COVID19,female,T1,COVID-19 female donor - first time point
-COV_F_T2,FILL_ME,COV_F,COVID19,female,T2,COVID-19 female donor - second time point (same person as COV_F_T1)
-COV_M_T1,FILL_ME,COV_M,COVID19,male,T1,COVID-19 male donor - first time point
-COV_M_T2,FILL_ME,COV_M,COVID19,male,T2,COVID-19 male donor - second time point (same person as COV_M_T1)
-HC_F,FILL_ME,HC_F,healthy,female,baseline,healthy control female
-HC_M,J15438_H013_control,H013,healthy,male,baseline,healthy control male (H013 in the 2022 version - please check)
+COV_F_TA,J09823_female_012_TA,P012,COVID19,female,TA,COVID-19 female donor 012 - time point A
+COV_F_TC,J09828_female_012_TC,P012,COVID19,female,TC,COVID-19 female donor 012 - time point C (same person as COV_F_TA)
+COV_M_TA,J09806_male_001_TA,P001,COVID19,male,TA,COVID-19 male donor 001 - time point A
+COV_M_TC,J09807_male_001_TC,P001,COVID19,male,TC,COVID-19 male donor 001 - time point C (same person as COV_M_TA)
+HC_F,J15438_female_H013_control,H013,healthy,female,baseline,healthy control female
+HC_M,J15439_male_H012_control,H012,healthy,male,baseline,healthy control male
