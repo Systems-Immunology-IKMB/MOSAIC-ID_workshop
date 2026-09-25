@@ -139,6 +139,11 @@ errors, such as assigning the wrong sex to a sample.
 # fileEncoding handles CSVs saved from Excel; strip.white removes stray spaces
 samples <- read.csv(params$sample_sheet, stringsAsFactors = FALSE,
                     fileEncoding = "UTF-8-BOM", strip.white = TRUE)
+# if the sheet has a short `sample` name, use it as the ID in all plots and keep the long ID as library_id
+if ("sample" %in% colnames(samples)) {
+  samples$library_id <- samples$sample_id
+  samples$sample_id  <- samples$sample
+}
 samples
 
 required <- c("sample_id", "folder", "donor", "disease", "sex", "timepoint")

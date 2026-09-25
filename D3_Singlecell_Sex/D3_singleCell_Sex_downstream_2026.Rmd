@@ -125,12 +125,12 @@ repeated_donors
 ```
 
 **Our design:** 4 donors, one per sex × disease group. Each COVID-19 donor
-was sampled at two time points (TA, TC), so we have 6 samples.
+was sampled at two time points (T1, T2), so we have 6 samples.
 
 | | female | male |
 |---|---|---|
-| COVID-19 | donor P012: COV_F_TA, COV_F_TC | donor P001: COV_M_TA, COV_M_TC |
-| healthy | donor H013: HC_F | donor H012: HC_M |
+| COVID-19 | donor COV_F: COV_F_T1, COV_F_T2 | donor COV_M: COV_M_T1, COV_M_T2 |
+| healthy | donor HC_F | donor HC_M |
 
 > **Exercise 1 (5 min, pen & paper).**
 >
@@ -149,7 +149,7 @@ was sampled at two time points (TA, TC), so we have 6 samples.
 **Solution.** (1) One donor per group. (2) With samples: 6 - 3 = 3 residual
 df (6 - 4 = 2 for `~ sex * disease`). With donors: 4 - 3 = 1, and 0 for the
 interaction model, so nothing is left to estimate the between-person
-variability. (3) TA vs TC of one patient measures *within-person* variability
+variability. (3) T1 vs T2 of one patient measures *within-person* variability
 (disease course and technical noise), not *between-person* variability. When
 we treat the time points as replicates, the COVID-19 groups look less variable
 than people really are, so p-values are too small. The healthy groups have no
