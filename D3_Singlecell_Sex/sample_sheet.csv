@@ -1,0 +1,7 @@
+sample_id,folder,sample,donor,disease,sex,timepoint,notes
+J09823_female_012_TA,/Users/joana/Documents/classes/D3_Singlecell_Sex/input/J09823_female_012_TA/,COV_F_T1,COV_F,COVID19,female,T1,COVID-19 female donor - first time point
+J09828_female_012_TC,/Users/joana/Documents/classes/D3_Singlecell_Sex/input/J09828_female_012_TC/,COV_F_T2,COV_F,COVID19,female,T2,COVID-19 female donor - second time point (same person as COV_F_T1)
+J09806_male_001_TA,/Users/joana/Documents/classes/D3_Singlecell_Sex/input/J09806_male_001_TA/,COV_M_T1,COV_M,COVID19,male,T1,COVID-19 male donor - first time point
+J09807_male_001_TC,/Users/joana/Documents/classes/D3_Singlecell_Sex/input/J09807_male_001_TC/,COV_M_T2,COV_M,COVID19,male,T2,COVID-19 male donor - second time point (same person as COV_M_T1)
+J15438_female_H013_control,/Users/joana/Documents/classes/D3_Singlecell_Sex/input/J15438_female_H013_control/,HC_F,HC_F,healthy,female,baseline,healthy control female
+J15439_male_H012_control,/Users/joana/Documents/classes/D3_Singlecell_Sex/input/J15439_male_H012_control/,HC_M,HC_M,healthy,male,baseline,healthy control male
